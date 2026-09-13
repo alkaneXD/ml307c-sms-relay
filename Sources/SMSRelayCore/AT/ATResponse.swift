@@ -51,4 +51,14 @@ public enum ATError: Error, LocalizedError, Sendable, Equatable {
         case .unexpected(let msg): return msg
         }
     }
+
+    public var isTimeout: Bool {
+        if case .timeout = self { return true }
+        return false
+    }
+
+    public var cmsErrorCode: Int? {
+        guard case .failure(_, let result) = self, result.hasPrefix("+CMS ERROR") else { return nil }
+        return Int(result.split(separator: ":").last?.trimmingCharacters(in: .whitespaces) ?? "")
+    }
 }

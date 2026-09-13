@@ -51,7 +51,12 @@ struct DiagnosticsView: View {
             row("IMSI", modem.sim.imsi)
             row("Operator", modem.operatorCode.map { "\(modem.operatorName) (\($0))" })
             row("Technology", modem.connection.isConnected ? modem.accessTechnologyName : nil)
-            row("Registration", modem.registration?.statusText)
+            row("EPS registration", modem.epsRegistration?.statusText)
+            row("CS registration", modem.csRegistration?.statusText)
+            row("IMS registration", modem.imsRegistered.map { $0 ? "Registered" : "Not registered" })
+            row("IMS SMS capability", modem.imsSMSAvailable.map { $0 ? "Available" : "Unavailable" })
+            row("UE IMS SMS setting", modem.imsSMSConfigured.map { $0 ? "Enabled" : "Disabled" })
+            row("SMS transport", modem.smsTransportText)
             row("Signal", modem.connection.isConnected
                 ? "\(modem.signal.level.label) · \(modem.signal.primaryDBmText)" : nil)
             row("SIM storage", modem.storageUsed.map { "\($0) / \(modem.storageTotal ?? 0)" })

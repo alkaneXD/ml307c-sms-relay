@@ -10,6 +10,7 @@ public final class Database: @unchecked Sendable {
     }
 
     private let queue = DispatchQueue(label: "smsrelay.sqlite")
+    private let queueKey = DispatchSpecificKey<UInt8>()
     private var db: OpaquePointer?
 
     public init(path: String) throws {
@@ -22,6 +23,7 @@ public final class Database: @unchecked Sendable {
             throw Error(message: "cannot open database: \(msg)")
         }
         db = handle
+        queue.setSpecific(key: queueKey, value: 1)
         try exec("PRAGMA journal_mode = WAL")
         try exec("PRAGMA foreign_keys = ON")
         try exec("PRAGMA busy_timeout = 5000")
@@ -30,7 +32,7 @@ public final class Database: @unchecked Sendable {
     deinit { if let db { sqlite3_close_v2(db) } }
 
     public func exec(_ sql: String) throws {
-        try queue.sync {
+        try serialized {
             var err: UnsafeMutablePointer<CChar>?
             guard sqlite3_exec(db, sql, nil, nil, &err) == SQLITE_OK else {
                 let msg = err.map { String(cString: $0) } ?? "unknown"
@@ -42,7 +44,7 @@ public final class Database: @unchecked Sendable {
 
     /// Runs `body` with a prepared statement. Bind parameters with `Statement.bind`, iterate with `step()`.
     public func withStatement<T>(_ sql: String, _ body: (Statement) throws -> T) throws -> T {
-        try queue.sync {
+        try serialized {
             var stmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
                 throw Error(message: "prepare failed: \(String(cString: sqlite3_errmsg(db))) — \(sql)")
@@ -59,6 +61,18 @@ public final class Database: @unchecked Sendable {
         }
     }
 
+    /// Executes one statement and returns sqlite3_changes() without allowing another
+    /// database operation to interleave and overwrite the connection-wide count.
+    public func runChanges(_ sql: String, _ params: [SQLValue] = []) throws -> Int {
+        try serialized {
+            try withStatement(sql) { s in
+                try s.bind(params)
+                _ = try s.step()
+            }
+            return Int(sqlite3_changes(db))
+        }
+    }
+
     public func scalarInt(_ sql: String, _ params: [SQLValue] = []) throws -> Int {
         try withStatement(sql) { s in
             try s.bind(params)
@@ -67,19 +81,30 @@ public final class Database: @unchecked Sendable {
     }
 
     public func lastInsertRowID() -> Int64 {
-        queue.sync { sqlite3_last_insert_rowid(db) }
+        serialized { sqlite3_last_insert_rowid(db) }
     }
 
     public func transaction<T>(_ body: () throws -> T) throws -> T {
-        try exec("BEGIN IMMEDIATE")
-        do {
-            let r = try body()
-            try exec("COMMIT")
-            return r
-        } catch {
-            try? exec("ROLLBACK")
-            throw error
+        try serialized {
+            try exec("BEGIN IMMEDIATE")
+            do {
+                let r = try body()
+                try exec("COMMIT")
+                return r
+            } catch {
+                try? exec("ROLLBACK")
+                throw error
+            }
         }
+    }
+
+    /// Transactions keep the queue for their entire body. Calls made by that body are
+    /// re-entrant and execute directly instead of deadlocking on queue.sync.
+    private func serialized<T>(_ body: () throws -> T) rethrows -> T {
+        if DispatchQueue.getSpecific(key: queueKey) != nil {
+            return try body()
+        }
+        return try queue.sync(execute: body)
     }
 }
 

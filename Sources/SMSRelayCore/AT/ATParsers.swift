@@ -50,8 +50,13 @@ public enum ATParsers {
         public let cellID: String?
         public let accessTechnology: Int?
 
-        public var isRegistered: Bool { status == 1 || status == 5 }
-        public var isRoaming: Bool { status == 5 }
+        /// 6/7 are the 3GPP "SMS only" registration states. They are uncommon on older
+        /// firmware, but are exactly the states an SMS-only relay must not reject.
+        public var isRegistered: Bool {
+            status == 1 || status == 5 || status == 6 || status == 7 || status == 9 || status == 10
+        }
+        public var isSMSOnly: Bool { status == 6 || status == 7 }
+        public var isRoaming: Bool { status == 5 || status == 7 || status == 10 }
         public var statusText: String {
             switch status {
             case 0: return "Not registered"
@@ -60,6 +65,11 @@ public enum ATParsers {
             case 3: return "Registration denied"
             case 4: return "Unknown"
             case 5: return "Registered (roaming)"
+            case 6: return "Registered for SMS only"
+            case 7: return "Registered for SMS only (roaming)"
+            case 8: return "Emergency services only"
+            case 9: return "Registered (CSFB not preferred)"
+            case 10: return "Registered (roaming, CSFB not preferred)"
             default: return "Status \(status)"
             }
         }

@@ -83,8 +83,8 @@ final class ForwardingService {
                 let permanent = (error as? TelegramError)?.isPermanent ?? false
                 let gaveUp = permanent && attempts >= maxPermanentAttempts
                 let delay = backoff[min(attempts - 1, backoff.count - 1)]
-                try? model.store.markFailed(id: msg.id, error: error.localizedDescription,
-                                            nextAttempt: gaveUp ? nil : Date().addingTimeInterval(delay), gaveUp: gaveUp)
+                _ = try? model.store.markFailed(id: msg.id, error: error.localizedDescription,
+                                                nextAttempt: gaveUp ? nil : Date().addingTimeInterval(delay), gaveUp: gaveUp)
                 model.telegramStatus = "Forwarding error: \(error.localizedDescription)"
                 model.log("forward #\(msg.id) failed (attempt \(attempts)\(gaveUp ? ", giving up" : "")): \(error.localizedDescription)")
                 if permanent { break }  // no point hammering the API with a bad token/chat

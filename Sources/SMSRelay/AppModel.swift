@@ -148,11 +148,12 @@ final class AppModel {
     }
 
     func modem(id: String) -> Modem? { modems.first { $0.id == id } }
-    func modem(routeKey: String) -> Modem? { modems.first { $0.routeKey == routeKey } }
+    func modem(routeKey: String) -> Modem? { modems.first { $0.matches(routeKey: routeKey) } }
 
-    /// The modem used for outgoing SMS that aren't a reply (composer, /sms) — first registered, else first.
+    /// The modem used for outgoing SMS that aren't a reply (composer, /sms) — prefer one
+    /// with a fresh SMS-capable registration, then any network-registered modem.
     var primaryModem: Modem? {
-        modems.first { $0.isRegistered } ?? modems.first
+        modems.first { $0.isSMSReady } ?? modems.first { $0.isRegistered } ?? modems.first
     }
 
     // MARK: - Aggregate status (menu bar / header)
@@ -214,7 +215,10 @@ final class AppModel {
             decoded = SMSDeliver(smsc: nil, sender: "unknown", protocolID: 0, encoding: .data8bit, timestamp: nil,
                                  timezoneOffset: nil, concat: nil, text: "[raw PDU] \(pdu)", hasUserDataHeader: false)
         }
-        let incoming = IncomingSMS(pdu: pdu, decoded: decoded, simNumber: modem.routeKey)
+        let incoming = IncomingSMS(
+            pdu: pdu, decoded: decoded, simNumber: modem.routeKey,
+            simDisplay: modem.sim.number ?? modem.label
+        )
         do {
             switch try store.ingest(incoming, forwardingEnabled: settings.forwardingEnabled) {
             case .stored(let msg):
@@ -253,7 +257,7 @@ final class AppModel {
         guard settings.telegramConfigured, message.telegramRequestID != nil else { return }
         let client = TelegramClient(token: settings.telegramBotToken)
         let reason = TelegramClient.escapeHTML(error.localizedDescription.replacingOccurrences(of: "AT+CMGS → ", with: ""))
-        let html = "⏳ Network didn't accept it yet (\(reason)) — retrying in \(Int(delay)) s."
+        let html = "⏳ No acknowledgement from the SMS network (\(reason)) — retrying in \(Int(delay)) s. The same stored SMS will be reused, but a carrier-side duplicate is still possible."
         _ = try? await client.sendMessage(chatID: settings.telegramChatID, html: html, replyTo: message.telegramRequestID)
     }
 

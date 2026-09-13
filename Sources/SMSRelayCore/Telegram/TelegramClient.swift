@@ -245,7 +245,7 @@ public struct TelegramClient: Sendable {
         var lines: [String] = []
         lines.append("📩 <b>\(escapeHTML(message.sender))</b>")
         var meta: [String] = [df.string(from: message.displayDate)]
-        if includeSIMNumber, let sim = message.simNumber, !sim.isEmpty {
+        if includeSIMNumber, let sim = message.simDisplay ?? message.simNumber, !sim.isEmpty {
             meta.append("→ \(escapeHTML(sim))" + (operatorName.map { " (\(escapeHTML($0)))" } ?? ""))
         }
         if message.partCount > 1 { meta.append("\(message.partCount) parts") }

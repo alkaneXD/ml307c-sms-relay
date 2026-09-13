@@ -165,7 +165,7 @@ final class TelegramInbound {
             let via = model.modem(routeKey: routeKey ?? "")
             model.log("telegram: \(request.fromName) queued SMS to \(number) via \(via?.label ?? "primary") (\(text.count) chars)")
             // If the target modem isn't ready, let the requester know it's queued.
-            let ready = via?.isRegistered ?? model.modems.contains { $0.isRegistered }
+            let ready = via?.isSMSReady ?? model.modems.contains { $0.isSMSReady }
             if !ready {
                 await reply("⏳ Modem is offline — queued for <b>\(TelegramClient.escapeHTML(number))</b>, will send when it's back.")
             }

@@ -19,5 +19,9 @@ let package = Package(
             name: "SMSRelay",
             dependencies: ["SMSRelayCore"]
         ),
+        .testTarget(
+            name: "SMSRelayCoreTests",
+            dependencies: ["SMSRelayCore"]
+        ),
     ]
 )

@@ -8,6 +8,8 @@ public enum PDUEncoder {
         public let hex: String
         /// Value for `AT+CMGS=<length>`: TPDU length excluding the SMSC octet.
         public let tpduLength: Int
+        /// TP-MR sent to the SMSC. A retry must preserve this value.
+        public let messageReference: UInt8
         public let sequence: Int
         public let total: Int
     }
@@ -40,6 +42,7 @@ public enum PDUEncoder {
     }
 
     public static func encodeSubmit(to destination: String, text: String, reference: UInt8? = nil,
+                                    messageReferenceBase: UInt8 = 0, rejectDuplicates: Bool = false,
                                     requestStatusReport: Bool = false) throws -> [Part] {
         guard let number = normalizeNumber(destination) else { throw EncodeError.invalidNumber(destination) }
         guard !text.isEmpty else { throw EncodeError.emptyText }
@@ -90,6 +93,7 @@ public enum PDUEncoder {
         for seq in 1...total {
             let udh: [UInt8] = total > 1 ? [0x05, 0x00, 0x03, ref, UInt8(total), UInt8(seq)] : []
             var first: UInt8 = 0x01  // SMS-SUBMIT, no validity period
+            if rejectDuplicates { first |= 0x04 }
             if !udh.isEmpty { first |= 0x40 }
             if requestStatusReport { first |= 0x20 }
 
@@ -110,14 +114,28 @@ public enum PDUEncoder {
                 dcs = 0x08
             }
 
-            var tpdu: [UInt8] = [first, 0x00]  // MR assigned by the modem
+            let messageReference = messageReferenceBase &+ UInt8(seq - 1)
+            var tpdu: [UInt8] = [first, messageReference]
             tpdu += da
             tpdu += [0x00, dcs, UInt8(udl)]
             tpdu += ud
             let hex = ([0x00] + tpdu).map { String(format: "%02X", $0) }.joined()
-            out.append(Part(hex: hex, tpduLength: tpdu.count, sequence: seq, total: total))
+            out.append(Part(hex: hex, tpduLength: tpdu.count, messageReference: messageReference,
+                            sequence: seq, total: total))
         }
         return out
+    }
+
+    /// Requests TP-RD while otherwise keeping the TE-side TPDU stable. Some AT modems replace
+    /// TP-MR before transmission, so callers must treat this as best-effort duplicate suppression.
+    public static func settingRejectDuplicates(in hex: String) throws -> String {
+        guard var bytes = PDUDecoder.hexToBytes(hex), let smscLength = bytes.first else {
+            throw PDUError.invalidHex
+        }
+        let firstOctet = Int(smscLength) + 1
+        guard firstOctet < bytes.count else { throw PDUError.truncated("SMS-SUBMIT first octet") }
+        bytes[firstOctet] |= 0x04
+        return bytes.map { String(format: "%02X", $0) }.joined()
     }
 
     // MARK: - helpers

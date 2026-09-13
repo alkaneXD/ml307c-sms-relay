@@ -43,16 +43,32 @@ public struct SMSDeliver: Equatable, Sendable {
     }
 }
 
+/// A network report for a previously submitted SMS, correlated by TP-MR and recipient.
+public struct SMSStatusReport: Equatable, Sendable {
+    public let smsc: String?
+    public let messageReference: UInt8
+    public let recipient: String
+    public let serviceCentreTimestamp: Date?
+    public let dischargeTime: Date?
+    public let status: UInt8
+
+    /// 0x00...0x1F are completed outcomes; zero specifically means delivered to the SME.
+    public var isDelivered: Bool { status == 0 }
+    public var isComplete: Bool { status <= 0x1F || status >= 0x40 }
+}
+
 public enum PDUError: Error, LocalizedError, Equatable {
     case invalidHex
     case truncated(String)
     case notDeliver(mti: UInt8)
+    case notStatusReport(mti: UInt8)
 
     public var errorDescription: String? {
         switch self {
         case .invalidHex: return "PDU is not valid hex"
         case .truncated(let where_): return "PDU truncated at \(where_)"
         case .notDeliver(let mti): return "PDU is not an SMS-DELIVER (MTI=\(mti))"
+        case .notStatusReport(let mti): return "PDU is not an SMS-STATUS-REPORT (MTI=\(mti))"
         }
     }
 }
@@ -137,6 +153,44 @@ public enum PDUDecoder {
             smsc: smsc, sender: sender, protocolID: pid, encoding: encoding,
             timestamp: timestamp, timezoneOffset: tz, concat: concat, text: text,
             hasUserDataHeader: udhi
+        )
+    }
+
+    public static func decodeStatusReport(hex: String) throws -> SMSStatusReport {
+        guard let bytes = hexToBytes(hex) else { throw PDUError.invalidHex }
+        var r = Reader(bytes)
+
+        let smscLen = Int(try r.byte("smsc length"))
+        var smsc: String?
+        if smscLen > 0 {
+            let toa = try r.byte("smsc toa")
+            let digits = try r.bytes(smscLen - 1, "smsc digits")
+            smsc = formatNumber(semiOctets: digits, digitCount: (smscLen - 1) * 2, toa: toa)
+        }
+
+        let first = try r.byte("status report first octet")
+        let mti = first & 0x03
+        guard mti == 0x02 else { throw PDUError.notStatusReport(mti: mti) }
+
+        let messageReference = try r.byte("status report message reference")
+        let recipientDigits = Int(try r.byte("status report recipient length"))
+        let recipientTOA = try r.byte("status report recipient toa")
+        let recipientBytes = try r.bytes((recipientDigits + 1) / 2, "status report recipient")
+        let recipient = formatNumber(
+            semiOctets: recipientBytes, digitCount: recipientDigits, toa: recipientTOA
+        )
+        let serviceCentreTimestamp = decodeTimestamp(
+            try r.bytes(7, "status report service centre timestamp")
+        ).0
+        let dischargeTime = decodeTimestamp(
+            try r.bytes(7, "status report discharge time")
+        ).0
+        let status = try r.byte("status report status")
+
+        return SMSStatusReport(
+            smsc: smsc, messageReference: messageReference, recipient: recipient,
+            serviceCentreTimestamp: serviceCentreTimestamp, dischargeTime: dischargeTime,
+            status: status
         )
     }
 

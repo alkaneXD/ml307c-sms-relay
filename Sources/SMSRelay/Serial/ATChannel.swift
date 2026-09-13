@@ -1,6 +1,12 @@
 import Foundation
 import SMSRelayCore
 
+struct ATPromptResponse {
+    let response: ATResponse
+    let promptLatency: TimeInterval
+    let finalLatency: TimeInterval
+}
+
 /// Serialised AT command channel over one serial port.
 ///
 /// Exactly one command is in flight at a time. Lines that arrive while a command is
@@ -8,7 +14,7 @@ import SMSRelayCore
 /// (+CMTI, +CREG, …) for a *different* prefix, in which case they go to `urcs`.
 actor ATChannel {
     private static let urcPrefixes = [
-        "+CMTI:", "+CMT:", "+CDS:", "+CDSI:", "+CBM:", "+CREG:", "+CEREG:", "+CGREG:",
+        "+CMTI:", "+CMT:", "+CDS:", "+CDSI:", "+CBM:", "+CREG:", "+CEREG:", "+CIREG:", "+CIREGU:", "+CGREG:",
         "+CPIN:", "+CTZV:", "+CTZE:", "+CGEV:", "+CUSD:", "+CLIP:", "RING", "NO CARRIER", "RDY",
         "+MSIMSTATE", "*", "^",
     ]
@@ -34,11 +40,13 @@ actor ATChannel {
     private let urcContinuation: AsyncStream<String>.Continuation
     private var lineBuffer: [UInt8] = []
     private var pending: Pending?
+    /// +CMT/+CDS/+CBM headers are followed by a raw payload line which has no URC prefix.
+    private var awaitingURCPayload = false
     private var nextID: UInt64 = 0
     private var busy = false
+    private var swallowCommandResults = 0
     private var waiters: [CheckedContinuation<Void, Never>] = []
     private var readerTask: Task<Void, Never>?
-    private var lastTimeout: Date?
     private(set) var isOpen = true
     private var logger: (@Sendable (String) -> Void)?
 
@@ -56,6 +64,7 @@ actor ATChannel {
 
     func start() {
         guard readerTask == nil else { return }
+        port.startReading()
         readerTask = Task { [weak self, port] in
             for await chunk in port.bytes {
                 await self?.ingest(chunk)
@@ -70,13 +79,9 @@ actor ATChannel {
     func send(_ command: String, timeout: Duration = .seconds(5)) async throws -> ATResponse {
         await acquire()
         defer { release() }
-        guard isOpen else { throw ATError.portClosed }
-
-        // After a timeout the modem may still emit the late reply; give it a moment so those
-        // lines drain as noise instead of being attributed to this command.
-        if let t = lastTimeout, Date().timeIntervalSince(t) < 2 {
-            try? await Task.sleep(for: .milliseconds(400))
-            lastTimeout = nil
+        guard isOpen else {
+            logger?("send \(command) aborted: already closed")
+            throw ATError.portClosed
         }
 
         nextID += 1
@@ -89,7 +94,9 @@ actor ATChannel {
                 try port.write(Data((command + "\r").utf8))
             } catch {
                 pending = nil
-                cont.resume(throwing: error)
+                let mapped = Self.mapSerialError(error)
+                close()
+                cont.resume(throwing: mapped)
                 return
             }
             pending?.timeout = armTimeout(id: id, timeout)
@@ -99,18 +106,17 @@ actor ATChannel {
 
     /// Two-phase command such as `AT+CMGS=<len>`: send the command, wait for the `>` prompt,
     /// then send `payload` terminated with Ctrl-Z and wait for the final result.
-    func sendWithPrompt(_ command: String, payload: Data, promptTimeout: Duration = .seconds(10),
-                        timeout: Duration = .seconds(60)) async throws -> ATResponse {
+    func sendWithPrompt(_ command: String, payload: Data,
+                        beforePayload: (@Sendable () throws -> Void)? = nil,
+                        promptTimeout: Duration = .seconds(10),
+                        timeout: Duration = .seconds(60)) async throws -> ATPromptResponse {
         await acquire()
         defer { release() }
         guard isOpen else { throw ATError.portClosed }
-        if let t = lastTimeout, Date().timeIntervalSince(t) < 2 {
-            try? await Task.sleep(for: .milliseconds(400))
-            lastTimeout = nil
-        }
 
         nextID += 1
         let id = nextID
+        let commandStarted = Date()
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             var p = Pending(id: id, command: command, prefix: Self.responsePrefix(for: command))
             p.prompt = cont
@@ -119,12 +125,16 @@ actor ATChannel {
                 try port.write(Data((command + "\r").utf8))
             } catch {
                 pending = nil
-                cont.resume(throwing: error)
+                let mapped = Self.mapSerialError(error)
+                close()
+                cont.resume(throwing: mapped)
                 return
             }
             pending?.timeout = armTimeout(id: id, promptTimeout)
         }
+        let promptLatency = Date().timeIntervalSince(commandStarted)
 
+        let payloadStarted = Date()
         let response: ATResponse = try await withCheckedThrowingContinuation { cont in
             guard var p = pending, p.id == id else {
                 abortPrompt()
@@ -139,15 +149,29 @@ actor ATChannel {
             p.result = cont
             pending = p
             do {
+                try beforePayload?()
+            } catch {
+                pending = nil
+                close()
+                cont.resume(throwing: error)
+                return
+            }
+            do {
                 try port.write(payload + Data([0x1A]))
             } catch {
                 pending = nil
-                cont.resume(throwing: error)
+                let mapped = Self.mapSerialError(error)
+                close()
+                cont.resume(throwing: mapped)
                 return
             }
             pending?.timeout = armTimeout(id: id, timeout)
         }
-        return response
+        return ATPromptResponse(
+            response: response,
+            promptLatency: promptLatency,
+            finalLatency: Date().timeIntervalSince(payloadStarted)
+        )
     }
 
     private func armTimeout(id: UInt64, _ duration: Duration) -> Task<Void, Never> {
@@ -159,9 +183,21 @@ actor ATChannel {
     }
 
     /// Abort a half-finished `AT+CMGS` (modem waiting at the `>` prompt) by sending ESC.
-    /// Safe to send at any time: outside prompt mode the modem ignores it.
+    /// Follow with CR: a bare ESC is consumed as a prefix and the next `AT` is lost.
     func abortPrompt() {
-        try? port.write(Data([0x1B]))
+        try? port.write(Data([0x1B, 0x0D]), timeout: 0.3)
+    }
+
+    /// Ack a `+CDS`/`+CMT`. If a command (usually `AT+CMGS`) is in flight, write the ack
+    /// without taking the lock so the modem can finish that command. Otherwise use the
+    /// normal queue so we do not interleave with the next heartbeat.
+    func acknowledgeNewMessage() async {
+        if pending != nil {
+            try? port.write(Data("AT+CNMA=1\r".utf8), timeout: 0.4)
+            swallowCommandResults += 1
+            return
+        }
+        _ = try? await send("AT+CNMA=1", timeout: .seconds(3))
     }
 
     /// Sends a command and throws unless the final result is OK.
@@ -216,8 +252,9 @@ actor ATChannel {
         }
         // The "> " prompt (AT+CMGS) never ends in \n: detect it in the partial line.
         if var p = pending, p.prompt != nil, let gt = lineBuffer.firstIndex(of: 0x3E) {
-            lineBuffer.removeSubrange(lineBuffer.startIndex...gt)
-            while lineBuffer.first == 0x20 { lineBuffer.removeFirst() }
+            let space = lineBuffer.index(after: gt)
+            guard space < lineBuffer.endIndex, lineBuffer[space] == 0x20 else { return }
+            lineBuffer.removeSubrange(lineBuffer.startIndex...space)
             p.timeout?.cancel()
             let cont = p.prompt
             p.prompt = nil
@@ -231,6 +268,18 @@ actor ATChannel {
 
     private func handleLine(_ line: String) {
         logger?("← \(line)")
+        if swallowCommandResults > 0, ATResponse.isFinalLine(line) {
+            swallowCommandResults -= 1
+            return
+        }
+        if awaitingURCPayload {
+            awaitingURCPayload = false
+            urcContinuation.yield(line)
+            return
+        }
+        if Self.startsMultilineURC(line) {
+            awaitingURCPayload = true
+        }
         guard var p = pending else {
             urcContinuation.yield(line)
             return
@@ -260,8 +309,10 @@ actor ATChannel {
     private func timedOut(id: UInt64) {
         guard let p = pending, p.id == id else { return }
         pending = nil
-        lastTimeout = Date()
         logger?("⏱ timeout: \(p.command)")
+        // A late result could be mistaken for the next command. Closing here, before the
+        // command releases its lock, wakes every queued caller into portClosed.
+        close()
         p.prompt?.resume(throwing: ATError.timeout(p.command))
         p.result?.resume(throwing: ATError.timeout(p.command))
     }
@@ -295,5 +346,17 @@ actor ATChannel {
     static func looksLikeURC(_ line: String, pendingPrefix: String?) -> Bool {
         if let p = pendingPrefix, line.hasPrefix(p) { return false }
         return urcPrefixes.contains { line.hasPrefix($0) }
+    }
+
+    private static func startsMultilineURC(_ line: String) -> Bool {
+        line.hasPrefix("+CMT:") || line.hasPrefix("+CDS:") || line.hasPrefix("+CBM:")
+    }
+
+    private static func mapSerialError(_ error: Error) -> Error {
+        switch error {
+        case SerialError.write(let errno_): return ATError.writeFailed(errno_)
+        case SerialError.closed: return ATError.portClosed
+        default: return error
+        }
     }
 }

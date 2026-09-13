@@ -73,7 +73,8 @@ final class ModemManager {
         // Probe unclaimed, not-yet-cached ports.
         let claimed = Set(services.values.map(\.port))
         for port in ports where !claimed.contains(port) && probeCache[port] == nil {
-            probeCache[port] = await probe(port)
+            // A busy/cold/silent port is transient; only cache a conclusive probe.
+            if let result = await probe(port) { probeCache[port] = result }
         }
 
         // Group discovered modem ports by IMEI; start a service for any new modem.
@@ -95,24 +96,59 @@ final class ModemManager {
     }
 
     /// Opens a port briefly to learn whether it's an ML307 and, if so, its IMEI.
-    private func probe(_ port: String) async -> Probe {
-        guard let ch = try? ATChannel(path: port) else { return .notModem }  // busy/inaccessible
-        await ch.start()
-        await ch.abortPrompt()
-        _ = try? await ch.send("AT", timeout: .milliseconds(600))
-        guard let ok = try? await ch.send("AT", timeout: .seconds(1)), ok.isOK else {
-            await ch.close(); return .notModem
-        }
-        _ = try? await ch.send("ATE0", timeout: .seconds(1))
-        let info = try? await ch.send("ATI", timeout: .seconds(2))
-        let isML307 = info?.informationText.uppercased().contains("ML307") == true
+    private func probe(_ port: String) async -> Probe? {
         let overridden = !app.settings.portPath.trimmingCharacters(in: .whitespaces).isEmpty
-        guard isML307 || overridden else { await ch.close(); return .notModem }
-        let imei = (try? await ch.send("AT+CGSN", timeout: .seconds(2)))?.informationText
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        await ch.close()
-        guard !imei.isEmpty else { return .notModem }
-        return .modem(imei: imei)
+        let name = URL(fileURLWithPath: port).lastPathComponent
+        let result = await Task.detached { () -> Probe? in
+            guard let ch = try? ATChannel(path: port) else {
+                Self.probeLog(name, "open failed")
+                return nil
+            }
+            await ch.start()
+            try? await Task.sleep(for: .milliseconds(50))
+            await ch.setLogger { line in
+                Self.probeLog(name, line)
+            }
+            do {
+                let ok = try await ch.send("AT", timeout: .seconds(2))
+                guard ok.isOK else {
+                    await ch.close()
+                    Self.probeLog(name, ok.final)
+                    return nil
+                }
+                _ = try? await ch.send("ATE0", timeout: .seconds(1))
+                let info = try? await ch.send("ATI", timeout: .seconds(2))
+                let isML307 = info?.informationText.uppercased().contains("ML307") == true
+                guard isML307 || overridden else {
+                    await ch.close()
+                    Self.probeLog(name, "not an ML307")
+                    return .notModem
+                }
+                let imei = (try? await ch.send("AT+CGSN", timeout: .seconds(2)))?.informationText
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                await ch.close()
+                guard !imei.isEmpty else {
+                    Self.probeLog(name, "empty IMEI")
+                    return nil
+                }
+                Self.probeLog(name, "ML307 …\(imei.suffix(6))")
+                return .modem(imei: imei)
+            } catch {
+                await ch.close()
+                Self.probeLog(name, error.localizedDescription)
+                // Diagnostic/NMEA ports stay silent. Cache them so they do not block
+                // the scan loop for 2s every few seconds.
+                if let atError = error as? ATError, atError.isTimeout {
+                    return .notModem
+                }
+                return nil
+            }
+        }.value
+        return result
+    }
+
+    private nonisolated static func probeLog(_ port: String, _ detail: String) {
+        FileHandle.standardError.write(Data("    [probe \(port)] \(detail)\n".utf8))
     }
 
     // MARK: - USB reset
