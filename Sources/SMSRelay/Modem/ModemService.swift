@@ -36,6 +36,7 @@ final class ModemService {
     private var unregisteredSince: Date?
     private var lastRadioKick: Date?
     private var lastAttachRequest: Date?
+    private var lastNoSignalBlink: Date?
     private var disconnectedSince: Date?
     private var downAlertSent = false
     private var registrationAlertSent = false
@@ -57,6 +58,10 @@ final class ModemService {
     private let radioKickCooldown: TimeInterval = 10 * 60
     private let downAlertDelay: TimeInterval = 90
     private let fastSMSRetryDelay: Duration = .seconds(3)
+    private let noSignalBlinkGrace: TimeInterval = 15
+    private let noSignalBlinkCooldown: TimeInterval = 30
+    private let noSignalBlinkOn: Duration = .milliseconds(100)
+    private let noSignalBlinkOff: Duration = .milliseconds(80)
 
     var port: String { modem.port }
 
@@ -162,6 +167,7 @@ final class ModemService {
             modem.registrationUpdatedAt = nil
             modem.smsReadySince = nil
             unregisteredSince = nil
+            lastNoSignalBlink = nil
             if disconnectedSince == nil { disconnectedSince = Date() }
             checkDownAlert()
             guard FileManager.default.fileExists(atPath: modem.port) else { break }
@@ -228,6 +234,7 @@ final class ModemService {
             }
             unregisteredSince = nil
             lastAttachRequest = nil
+            lastNoSignalBlink = nil
             return
         }
         let since = unregisteredSince ?? Date()
@@ -394,6 +401,25 @@ final class ModemService {
         Task { await applyNetworkLED(ch) }
     }
 
+    /// CSQ 99 and not camped — the HDMI/port-power failure mode. Skip the first
+    /// seconds after connect so a normal attach is not strobed.
+    private func blinkNoSignalIfNeeded(_ ch: ATChannel) async {
+        guard modem.connection.isConnected, !modem.isRegistered,
+              modem.signal.rssiIndex == nil else { return }
+        guard let since = modem.connection.connectedSince,
+              Date().timeIntervalSince(since) >= noSignalBlinkGrace else { return }
+        if let last = lastNoSignalBlink, Date().timeIntervalSince(last) < noSignalBlinkCooldown { return }
+        lastNoSignalBlink = Date()
+        app.log("modem …\(modem.id.suffix(6)) no signal — blinking NET LED 5×")
+        for _ in 0..<5 {
+            _ = try? await ch.send("AT+MLED=0,1", timeout: .seconds(1))
+            try? await Task.sleep(for: noSignalBlinkOn)
+            _ = try? await ch.send("AT+MLED=0,0", timeout: .seconds(1))
+            try? await Task.sleep(for: noSignalBlinkOff)
+        }
+        await applyNetworkLED(ch)
+    }
+
     /// Keep the modem off the Mac's internet: disable host ECM auto-dialup; keep the module's
     /// own auto-attach ON (autoconn=0 stops the LTE attach on this firmware).
     private func disableModemData(_ ch: ATChannel) async {
@@ -482,6 +508,7 @@ final class ModemService {
             do {
                 try await refreshStatus(ch)
                 await registrationWatchdog(ch)
+                await blinkNoSignalIfNeeded(ch)
             } catch ATError.portClosed {
                 throw ModemError.disconnected
             } catch {
