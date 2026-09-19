@@ -4,7 +4,7 @@
 -- together with an Air780EPM kernel that includes the sms library (1/2/103–106).
 
 PROJECT = "smsrelay-at"
-VERSION = "0.5.3"
+VERSION = "0.5.4"
 
 sys = require("sys")
 if wdt then
@@ -53,7 +53,11 @@ end
 
 local function bytes_to_hex(t)
     local out = {}
-    for i = 1, #t do out[i] = string.format("%02X", t[i]) end
+    for i = 1, #t do
+        local v = t[i] % 256
+        if v < 0 then v = v + 256 end
+        out[i] = string.format("%02X", v)
+    end
     return table.concat(out)
 end
 
@@ -154,25 +158,162 @@ end
 local function scts_now()
     local t = os.date("*t")
     local function bcd(n) return math.floor(n / 10) + (n % 10) * 16 end
-    -- timezone +08 → 0x80 swapped nibble-ish; use 0x08 for +8 quarters? 32 quarters = +8h → 0x23 swapped 0x32
+    -- timezone +08: 32 quarters of an hour, GSM nibble-swapped → 0x23
     return { bcd(t.year % 100), bcd(t.month), bcd(t.day), bcd(t.hour), bcd(t.min), bcd(t.sec), 0x23 }
 end
 
-local function deliver_pdu(num, text)
-    local digits = tostring(num or ""):gsub("[^0-9]", "")
-    local oa = { #digits, 0x91 }
-    for _, b in ipairs(bcd_swap(digits)) do oa[#oa + 1] = b end
-    local ud = utf8_to_utf16be(text or "")
-    local tpdu = { 0x04 }
-    for _, b in ipairs(oa) do tpdu[#tpdu + 1] = b end
-    tpdu[#tpdu + 1] = 0x00
-    tpdu[#tpdu + 1] = 0x08
-    for _, b in ipairs(scts_now()) do tpdu[#tpdu + 1] = b end
-    tpdu[#tpdu + 1] = #ud
-    for _, b in ipairs(ud) do tpdu[#tpdu + 1] = b end
-    local pdu = { 0x00 }
-    for _, b in ipairs(tpdu) do pdu[#pdu + 1] = b end
-    return bytes_to_hex(pdu), #tpdu
+local GSM7_REV = {}
+for i, ch in ipairs(GSM7) do
+    if ch ~= "\x1B" then GSM7_REV[ch] = i - 1 end
+end
+local GSM7_EXT = {
+    ["\f"] = 0x0A, ["^"] = 0x14, ["{"] = 0x28, ["}"] = 0x29, ["\\"] = 0x2F,
+    ["["] = 0x3C, ["~"] = 0x3D, ["]"] = 0x3E, ["|"] = 0x40, ["€"] = 0x65,
+}
+
+local function to_septets(s)
+    local sep = {}
+    for _, cp in utf8.codes(s) do
+        local ch = utf8.char(cp)
+        if GSM7_REV[ch] then
+            sep[#sep + 1] = GSM7_REV[ch]
+        elseif GSM7_EXT[ch] then
+            sep[#sep + 1] = 0x1B
+            sep[#sep + 1] = GSM7_EXT[ch]
+        else
+            return nil
+        end
+    end
+    return sep
+end
+
+local function pack_septets(sep, skip_bits)
+    skip_bits = skip_bits or 0
+    local nbytes = math.floor((skip_bits + #sep * 7 + 7) / 8)
+    local out = {}
+    for i = 1, nbytes do out[i] = 0 end
+    local bit = skip_bits
+    for i = 1, #sep do
+        local s = sep[i]
+        for b = 0, 6 do
+            if (s >> b) & 1 == 1 then
+                local bi = math.floor(bit / 8) + 1
+                out[bi] = out[bi] + (1 << (bit % 8))
+            end
+            bit = bit + 1
+        end
+    end
+    return out
+end
+
+local function encode_oa(num)
+    local s = tostring(num or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if s == "" then return { 0, 0x81 } end
+    local digits = s:gsub("[^0-9]", "")
+    local compact = s:gsub("[%s%-%(%)%+]", "")
+    if #digits >= 3 and digits == compact then
+        local toa = (s:find("+", 1, true) or #digits >= 11) and 0x91 or 0x81
+        local oa = { #digits, toa }
+        for _, b in ipairs(bcd_swap(digits)) do oa[#oa + 1] = b end
+        return oa
+    end
+    local sep = to_septets(s)
+    if not sep or #sep == 0 then
+        if #digits >= 3 then
+            local oa = { #digits, 0x91 }
+            for _, b in ipairs(bcd_swap(digits)) do oa[#oa + 1] = b end
+            return oa
+        end
+        return { 0, 0x81 }
+    end
+    local packed = pack_septets(sep, 0)
+    local oa = { math.ceil(#sep * 7 / 4), 0xD0 }
+    for _, b in ipairs(packed) do oa[#oa + 1] = b end
+    return oa
+end
+
+-- LuatOS concatenates long SMS into one string. Each AT PDU must stay ≤140 user octets.
+local function deliver_pdus(num, text)
+    text = text or ""
+    local oa = encode_oa(num)
+    local sep = to_septets(text)
+    local chunks = {}
+    if sep then
+        if #sep <= 160 then
+            chunks[1] = { kind = "gsm7", sep = sep }
+        else
+            local i = 1
+            while i <= #sep do
+                local e = math.min(i + 152, #sep)
+                if e < #sep and sep[e] == 0x1B then e = e - 1 end
+                local part = {}
+                for j = i, e do part[#part + 1] = sep[j] end
+                chunks[#chunks + 1] = { kind = "gsm7", sep = part }
+                i = e + 1
+            end
+        end
+    else
+        local ud = utf8_to_utf16be(text)
+        if #ud <= 140 then
+            chunks[1] = { kind = "ucs2", bytes = ud }
+        else
+            local i = 1
+            while i <= #ud do
+                local e = math.min(i + 133, #ud)
+                if (e - i + 1) % 2 == 1 then e = e - 1 end
+                if e >= i + 1 then
+                    local unit = ud[e - 1] * 256 + ud[e]
+                    if unit >= 0xD800 and unit <= 0xDBFF then e = e - 2 end
+                end
+                local part = {}
+                for j = i, e do part[#part + 1] = ud[j] end
+                chunks[#chunks + 1] = { kind = "ucs2", bytes = part }
+                i = e + 1
+            end
+        end
+    end
+    local total = math.min(#chunks, 10)
+    local ref = math.random(0, 255)
+    local out = {}
+    for seq = 1, total do
+        local ch = chunks[seq]
+        local first = 0x04
+        local udh = {}
+        if total > 1 then
+            first = first + 0x40
+            udh = { 0x05, 0x00, 0x03, ref, total, seq }
+        end
+        local ud, udl, dcs
+        if ch.kind == "gsm7" then
+            dcs = 0x00
+            local header_bits = #udh * 8
+            local header_septets = math.floor((header_bits + 6) / 7)
+            local skip = (#udh > 0) and (header_septets * 7 - header_bits) or 0
+            local packed = pack_septets(ch.sep, skip)
+            ud = {}
+            for _, b in ipairs(udh) do ud[#ud + 1] = b end
+            for _, b in ipairs(packed) do ud[#ud + 1] = b end
+            udl = header_septets + #ch.sep
+        else
+            dcs = 0x08
+            ud = {}
+            for _, b in ipairs(udh) do ud[#ud + 1] = b end
+            for _, b in ipairs(ch.bytes) do ud[#ud + 1] = b end
+            udl = #ud
+        end
+        if udl > 255 then udl = 255 end
+        local tpdu = { first }
+        for _, b in ipairs(oa) do tpdu[#tpdu + 1] = b end
+        tpdu[#tpdu + 1] = 0x00
+        tpdu[#tpdu + 1] = dcs
+        for _, b in ipairs(scts_now()) do tpdu[#tpdu + 1] = b end
+        tpdu[#tpdu + 1] = udl
+        for _, b in ipairs(ud) do tpdu[#tpdu + 1] = b end
+        local pdu = { 0x00 }
+        for _, b in ipairs(tpdu) do pdu[#pdu + 1] = b end
+        out[#out + 1] = bytes_to_hex(pdu)
+    end
+    return out
 end
 
 local function decode_submit(hex)
@@ -564,12 +705,18 @@ sys.subscribe("SMS_READY", function()
     log.info("smsrelay-at", "SMS_READY")
 end)
 
-sms.setNewSmsCb(function(num, txt)
-    local pdu = deliver_pdu(num, txt)
-    local idx = next_idx
-    next_idx = next_idx + 1
-    inbox[idx] = { pdu = pdu, status = 0 }
-    write(string.format("\r\n+CMTI: \"%s\",%d\r\n", sms_mem, idx))
+sms.setNewSmsCb(function(num, txt, metas)
+    if (not num or num == "") and type(metas) == "table" then
+        num = metas.num or metas.oa or num
+    end
+    log.info("smsrelay-at", "SMS", tostring(num), txt and #tostring(txt) or 0)
+    local parts = deliver_pdus(num, tostring(txt or ""))
+    for i = 1, #parts do
+        local idx = next_idx
+        next_idx = next_idx + 1
+        inbox[idx] = { pdu = parts[i], status = 0 }
+        write(string.format("\r\n+CMTI: \"%s\",%d\r\n", sms_mem, idx))
+    end
 end)
 
 sys.subscribe("IP_READY", function()

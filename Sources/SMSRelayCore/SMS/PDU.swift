@@ -75,7 +75,47 @@ public enum PDUError: Error, LocalizedError, Equatable {
 
 public enum PDUDecoder {
     public static func decode(hex: String) throws -> SMSDeliver {
-        guard let bytes = hexToBytes(hex) else { throw PDUError.invalidHex }
+        let clean = hex.filter { !$0.isWhitespace }.uppercased()
+        if let bytes = hexToBytes(clean) {
+            return try decode(bytes: bytes)
+        }
+        if let recovered = recoverWideUDL(clean) {
+            return try decode(bytes: recovered)
+        }
+        throw PDUError.invalidHex
+    }
+
+    /// Air780 firmware 0.5.3 printed `string.format("%02X", udl)` for UDL > 255 (e.g. 450 → "1C2"),
+    /// producing odd-length hex. Rebuild a well-formed PDU using the real user-data bytes.
+    static func recoverWideUDL(_ hex: String) -> [UInt8]? {
+        guard hex.count % 2 == 1, hex.allSatisfy(\.isHexDigit) else { return nil }
+        var i = 0
+        func takeByte() -> UInt8? {
+            guard i + 2 <= hex.count else { return nil }
+            let s = hex.dropFirst(i).prefix(2)
+            i += 2
+            return UInt8(s, radix: 16)
+        }
+        guard let smscLen = takeByte() else { return nil }
+        i += Int(smscLen) * 2
+        guard i + 2 <= hex.count else { return nil }
+        i += 2 // first octet
+        guard let oaDigits = takeByte(), takeByte() != nil else { return nil }
+        i += ((Int(oaDigits) + 1) / 2) * 2
+        guard takeByte() != nil, takeByte() != nil else { return nil } // PID, DCS
+        i += 14 // SCTS
+        let rest = String(hex.dropFirst(i))
+        for width in [3, 4] where rest.count > width {
+            let udHex = String(rest.dropFirst(width))
+            guard udHex.count % 2 == 0, !udHex.isEmpty else { continue }
+            let prefix = String(hex.prefix(i))
+            let udl = String(format: "%02X", min(udHex.count / 2, 255))
+            return hexToBytes(prefix + udl + udHex)
+        }
+        return nil
+    }
+
+    static func decode(bytes: [UInt8]) throws -> SMSDeliver {
         var r = Reader(bytes)
 
         // --- SMSC ---
@@ -137,8 +177,13 @@ public enum PDUDecoder {
             let septets = max(0, udl - skipSeptets)
             text = GSM7.decode(packed: ud, septetCount: septets, skipBits: skipBits)
         case .ucs2:
-            let body = Array(ud.dropFirst(headerOctets).prefix(max(0, udl - headerOctets)))
-            text = decodeUCS2(body)
+            let body = Array(ud.dropFirst(headerOctets))
+            let want = max(0, udl - headerOctets)
+            // Honour UDL when it matches a normal TPDU (≤140). If leftover is longer, this is
+            // recovered Air780 long-UCS2: take every remaining octet.
+            let slice = (want > 0 && body.count > want && body.count <= 140)
+                ? Array(body.prefix(want)) : body
+            text = decodeUCS2(slice)
         case .data8bit:
             let body = Array(ud.dropFirst(headerOctets).prefix(max(0, udl - headerOctets)))
             // Binary payloads (WAP push, vendor data) are kept as hex rather than mangled text.

@@ -37,6 +37,11 @@ OK
 
 `AT+CNETLIGHT=0` turns the network LED off; `=1` turns it on. The Mac app maps its existing LED toggle to this command.
 
+Script **0.5.4**:
+
+- Incoming long SMS is split into concatenated PDUs (GSM 7-bit when possible, UCS2 otherwise). 0.5.3 wrote a 3-digit UDL for messages over 140 bytes, so the Mac stored `[raw PDU]`.
+- Alphanumeric senders (GCash, etc.) use TOA 0xD0 instead of an empty number.
+
 Script **0.5.3**:
 
 - `AT+CMGS` waits for LuatOS `SMS_SENT` (0.5.1 returned OK in ~5 ms on queue).
