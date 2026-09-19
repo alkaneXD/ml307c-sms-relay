@@ -44,4 +44,67 @@ final class Air780DeliverPDUTests: XCTestCase {
         XCTAssertEqual(parts[0].hex.count % 2, 0)
         XCTAssertTrue(parts[0].hex.contains("0008") || parts[0].hex.contains("08"))
     }
+
+    func testEmojiAndMixedUCS2Deliver() throws {
+        let d = try PDUDecoder.decode(bytes: ucs2Deliver(oa: "+639171234567", text: "hi 😀🎉"))
+        XCTAssertEqual(d.sender, "+639171234567")
+        XCTAssertEqual(d.encoding, .ucs2)
+        XCTAssertEqual(d.text, "hi 😀🎉")
+    }
+
+    func testEmojiSurrogateNotSplitAcrossConcatParts() throws {
+        // 70 BMP chars would fit one UCS2 SMS; one emoji is 2 UTF-16 units so 69 + emoji
+        // needs a second part if we fill to the 67-unit concat payload.
+        let text = String(repeating: "A", count: 66) + "😀"
+        let units = Array(text.utf16)
+        XCTAssertGreaterThan(units.count, 67)
+        let p1Text = String(decoding: units.prefix(66), as: UTF16.self) // 66 A's, emoji stays on part 2
+        let p2Text = String(decoding: units.suffix(from: 66), as: UTF16.self)
+        XCTAssertEqual(p2Text, "😀")
+        let p1 = ucs2Deliver(oa: "+639171234567", text: p1Text, concat: (0x42, 2, 1))
+        let p2 = ucs2Deliver(oa: "+639171234567", text: p2Text, concat: (0x42, 2, 2))
+        let d1 = try PDUDecoder.decode(bytes: p1)
+        let d2 = try PDUDecoder.decode(bytes: p2)
+        XCTAssertEqual(d1.concat?.sequence, 1)
+        XCTAssertEqual(d2.concat?.sequence, 2)
+        XCTAssertEqual(d1.text + d2.text, text)
+        XCTAssertFalse(d1.text.contains("\u{FFFD}"))
+        XCTAssertEqual(d2.text, "😀")
+    }
+
+    func testZWJFamilyEmojiRoundTrip() throws {
+        let family = "👨‍👩‍👧‍👦"
+        let d = try PDUDecoder.decode(bytes: ucs2Deliver(oa: "+639171234567", text: family))
+        XCTAssertEqual(d.text, family)
+    }
+
+    func testOutgoingEmojiUsesUCS2() throws {
+        let parts = try PDUEncoder.encodeSubmit(to: "+639171234567", text: "ok 👍")
+        XCTAssertEqual(parts.count, 1)
+        XCTAssertTrue(parts[0].hex.contains("0008") || parts[0].hex.contains("08"))
+        XCTAssertEqual(parts[0].hex.count % 2, 0)
+    }
+
+    /// SMS-DELIVER, DCS UCS2, same layout the Air780 firmware emits.
+    private func ucs2Deliver(oa: String, text: String, concat: (UInt8, UInt8, UInt8)? = nil) -> [UInt8] {
+        let digits = oa.filter(\.isNumber)
+        let toa: UInt8 = oa.hasPrefix("+") ? 0x91 : 0x81
+        var first: UInt8 = 0x04
+        var ud: [UInt8] = []
+        if let c = concat {
+            first |= 0x40
+            ud += [0x05, 0x00, 0x03, c.0, c.1, c.2]
+        }
+        for u in text.utf16 {
+            ud.append(UInt8(u >> 8))
+            ud.append(UInt8(truncatingIfNeeded: u))
+        }
+        var tpdu: [UInt8] = [first, UInt8(digits.count), toa]
+        tpdu += PDUEncoder.semiOctets(digits)
+        tpdu += [0x00, 0x08]
+        tpdu += [0x62, 0x90, 0x02, 0x10, 0x92, 0x35, 0x23]
+        tpdu.append(UInt8(ud.count))
+        tpdu += ud
+        return [0x00] + tpdu
+    }
 }

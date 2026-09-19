@@ -4,7 +4,7 @@
 -- together with an Air780EPM kernel that includes the sms library (1/2/103–106).
 
 PROJECT = "smsrelay-at"
-VERSION = "0.5.4"
+VERSION = "0.5.5"
 
 sys = require("sys")
 if wdt then
@@ -100,7 +100,7 @@ end
 
 local function utf8_to_utf16be(s)
     local out = {}
-    for _, cp in utf8.codes(s) do
+    local function append_cp(cp)
         if cp <= 0xFFFF then
             out[#out + 1] = math.floor(cp / 256)
             out[#out + 1] = cp % 256
@@ -110,6 +110,15 @@ local function utf8_to_utf16be(s)
             local lo = 0xDC00 + (cp % 0x400)
             out[#out + 1] = math.floor(hi / 256); out[#out + 1] = hi % 256
             out[#out + 1] = math.floor(lo / 256); out[#out + 1] = lo % 256
+        end
+    end
+    -- iOS/Android emoji is UTF-8 from LuatOS. Invalid octets fall back to U+00xx.
+    if utf8.len(s) then
+        for _, cp in utf8.codes(s) do append_cp(cp) end
+    else
+        for i = 1, #s do
+            out[#out + 1] = 0
+            out[#out + 1] = s:byte(i)
         end
     end
     return out
@@ -172,6 +181,7 @@ local GSM7_EXT = {
 }
 
 local function to_septets(s)
+    if not utf8.len(s) then return nil end
     local sep = {}
     for _, cp in utf8.codes(s) do
         local ch = utf8.char(cp)
@@ -706,17 +716,20 @@ sys.subscribe("SMS_READY", function()
 end)
 
 sms.setNewSmsCb(function(num, txt, metas)
-    if (not num or num == "") and type(metas) == "table" then
-        num = metas.num or metas.oa or num
-    end
-    log.info("smsrelay-at", "SMS", tostring(num), txt and #tostring(txt) or 0)
-    local parts = deliver_pdus(num, tostring(txt or ""))
-    for i = 1, #parts do
-        local idx = next_idx
-        next_idx = next_idx + 1
-        inbox[idx] = { pdu = parts[i], status = 0 }
-        write(string.format("\r\n+CMTI: \"%s\",%d\r\n", sms_mem, idx))
-    end
+    local ok, err = pcall(function()
+        if (not num or num == "") and type(metas) == "table" then
+            num = metas.num or metas.oa or num
+        end
+        log.info("smsrelay-at", "SMS", tostring(num), txt and #tostring(txt) or 0)
+        local parts = deliver_pdus(num, tostring(txt or ""))
+        for i = 1, #parts do
+            local idx = next_idx
+            next_idx = next_idx + 1
+            inbox[idx] = { pdu = parts[i], status = 0 }
+            write(string.format("\r\n+CMTI: \"%s\",%d\r\n", sms_mem, idx))
+        end
+    end)
+    if not ok then log.info("smsrelay-at", "SMS encode fail", err) end
 end)
 
 sys.subscribe("IP_READY", function()

@@ -37,6 +37,10 @@ OK
 
 `AT+CNETLIGHT=0` turns the network LED off; `=1` turns it on. The Mac app maps its existing LED toggle to this command.
 
+Script **0.5.5**:
+
+- Incoming emoji / Chinese / any non-GSM7 text is UCS2 (UTF-16BE, including surrogate pairs). Invalid UTF-8 from the radio is not dropped.
+
 Script **0.5.4**:
 
 - Incoming long SMS is split into concatenated PDUs (GSM 7-bit when possible, UCS2 otherwise). 0.5.3 wrote a 3-digit UDL for messages over 140 bytes, so the Mac stored `[raw PDU]`.
