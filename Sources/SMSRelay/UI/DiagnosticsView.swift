@@ -7,26 +7,39 @@ struct DiagnosticsView: View {
     var body: some View {
         VStack(spacing: 0) {
             Form {
-                if model.modems.isEmpty {
+                if model.settingsModemID == "app" {
+                    Section("App") {
+                        row("Version", AppInfo.version)
+                    }
                     Section("Modems") {
-                        Text("No modem detected. Plug in an ML307C via USB.")
+                        if model.modems.isEmpty {
+                            Text("No modem detected. Plug in an ML307C or Air780 via USB.")
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(model.modems) { m in
+                                LabeledContent(m.settingsChipTitle, value: m.isRegistered ? m.operatorName : "not registered")
+                            }
+                        }
+                    }
+                    Section("Safeguards") {
+                        row("macOS network service", model.networkGuardStatus)
+                        row("Supervision", KeepAlive.isLaunchdManaged ? "launchd (auto-restart)" : "manual launch")
+                        row("Idle sleep", model.isPreventingSleep ? "prevented" : "allowed")
+                        row("Last error", model.lastError)
+                        HStack {
+                            Button("Re-check network guard") { Task { await model.recheckNetworkGuard() } }
+                                .disabled(!model.anyConnected)
+                            Spacer()
+                        }
+                        .help("The modem's USB Ethernet interface must never become the default route.")
+                    }
+                } else if let modem = model.selectedModem {
+                    modemSection(modem)
+                } else {
+                    Section("Modem") {
+                        Text("Not plugged in")
                             .foregroundStyle(.secondary)
                     }
-                }
-                ForEach(model.modems) { modem in
-                    modemSection(modem)
-                }
-                Section("Safeguards") {
-                    row("macOS network service", model.networkGuardStatus)
-                    row("Supervision", KeepAlive.isLaunchdManaged ? "launchd (auto-restart)" : "manual launch")
-                    row("Idle sleep", model.isPreventingSleep ? "prevented" : "allowed")
-                    row("Last error", model.lastError)
-                    HStack {
-                        Button("Re-check network guard") { Task { await model.recheckNetworkGuard() } }
-                            .disabled(!model.anyConnected)
-                        Spacer()
-                    }
-                    .help("The modem's USB Ethernet interface must never become the default route.")
                 }
             }
             .formStyle(.grouped)
@@ -42,7 +55,7 @@ struct DiagnosticsView: View {
     private func modemSection(_ modem: Modem) -> some View {
         Section(modem.label) {
             row("Model", modem.info.model)
-            row("Firmware", modem.info.firmware)
+            row("Modem firmware", modem.info.firmware)
             row("IMEI", modem.id)
             row("Port", modem.port)
             row("SIM status", modem.sim.status)
@@ -88,7 +101,7 @@ struct DiagnosticsView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 1) {
-                    ForEach(model.logEntries) { entry in
+                    ForEach(model.visibleLogEntries) { entry in
                         Text("\(entry.date, format: .dateTime.hour().minute().second()) \(entry.text)")
                             .font(.system(size: 10, design: .monospaced))
                             .foregroundStyle(.secondary)
@@ -101,11 +114,11 @@ struct DiagnosticsView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .textSelection(.enabled)
-            .onChange(of: model.logEntries.last?.id) { _, id in
+            .onChange(of: model.visibleLogEntries.last?.id) { _, id in
                 if let id { proxy.scrollTo(id, anchor: .bottom) }
             }
             .onAppear {
-                if let id = model.logEntries.last?.id { proxy.scrollTo(id, anchor: .bottom) }
+                if let id = model.visibleLogEntries.last?.id { proxy.scrollTo(id, anchor: .bottom) }
             }
         }
     }

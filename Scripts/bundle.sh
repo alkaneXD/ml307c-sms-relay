@@ -8,12 +8,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CONFIG="${1:-release}"
 ARCH="${2:-$(uname -m)}"
-APP_NAME="ML307C SMS Relay"
+APP_NAME="SMS Relay"
 EXEC_NAME="SMSRelay"
 BUNDLE_ID="dev.smsrelay.app"
 BIN="$ROOT/.build/${ARCH}-apple-macosx/$CONFIG/$EXEC_NAME"
 [[ -x "$BIN" ]] || BIN="$ROOT/.build/$CONFIG/$EXEC_NAME"
-OUT="$ROOT/build/$APP_NAME.app"
+OUT="${SMSRELAY_APP_OUT:-$ROOT/build/$APP_NAME.app}"
 IDENTITY="${CODESIGN_IDENTITY:--}"   # "-" = ad-hoc; export CODESIGN_IDENTITY="Developer ID Application: …" to sign for real
 
 if [[ ! -x "$BIN" ]]; then

@@ -1,8 +1,8 @@
-# ML307C SMS Relay — SMS ↔ Telegram bridge for the ML307C USB modem (macOS menu bar app)
+# SMS Relay — SMS ↔ Telegram bridge for ML307C and Air780EPM USB modems (macOS menu bar app)
 #
 #   make build     compile (release, arm64, whole-module optimised)
-#   make app       build + wrap into "build/ML307C SMS Relay.app" (stripped, ad-hoc signed)
-#   make dmg       build app + package build/ML307C-SMS-Relay-<version>-arm64.dmg
+#   make app       build + wrap into "build/SMS Relay.app" (stripped, ad-hoc signed)
+#   make dmg       build app + package build/SMS-Relay-<version>-arm64.dmg
 #   make run       build app and launch it
 #   make install   copy the app to /Applications
 #   make debug     run the raw debug binary in the foreground (AT trace on stderr)
@@ -12,7 +12,7 @@
 # Set CODESIGN_IDENTITY="Developer ID Application: …" to sign with a real certificate.
 
 ARCH ?= arm64
-APP = build/ML307C SMS Relay.app
+APP = build/SMS Relay.app
 RELEASE_FLAGS = -c release --arch $(ARCH) \
 	-Xswiftc -O -Xswiftc -wmo \
 	-Xlinker -dead_strip
@@ -25,16 +25,16 @@ build:
 app: build
 	Scripts/bundle.sh release $(ARCH)
 
-dmg: app
+dmg: build
 	Scripts/make-dmg.sh
 
 run: app
 	open "$(APP)"
 
 install: app
-	rm -rf "/Applications/ML307C SMS Relay.app"
-	cp -R "$(APP)" "/Applications/ML307C SMS Relay.app"
-	@echo "installed /Applications/ML307C SMS Relay.app"
+	rm -rf "/Applications/SMS Relay.app" "/Applications/ML307C SMS Relay.app"
+	cp -R "$(APP)" "/Applications/SMS Relay.app"
+	@echo "installed /Applications/SMS Relay.app"
 
 debug:
 	swift build

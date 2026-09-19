@@ -104,13 +104,6 @@ struct ComposeView: View {
             TextField("Message", text: $text, axis: .vertical)
                 .lineLimit(2...5)
                 .textFieldStyle(.roundedBorder)
-            if model.modems.count > 1 {
-                Picker("From SIM", selection: $viaModemID) {
-                    ForEach(model.modems) { m in
-                        Text(m.label).tag(m.id)
-                    }
-                }
-            }
             HStack {
                 Text(lengthHint)
                     .font(.caption)
@@ -119,7 +112,7 @@ struct ComposeView: View {
                 Spacer()
                 Button("Send via SIM") {
                     do {
-                        let via = model.modems.first { $0.id == viaModemID }
+                        let via = model.selectedModem ?? model.modems.first { $0.id == viaModemID }
                         try model.sendSMS(to: number, text: text.trimmingCharacters(in: .whitespacesAndNewlines), via: via)
                         onDone()
                     } catch {
@@ -132,7 +125,7 @@ struct ComposeView: View {
         }
         .padding(10)
         .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
-        .onAppear { if viaModemID.isEmpty { viaModemID = model.primaryModem?.id ?? "" } }
+        .onAppear { viaModemID = model.selectedModem?.id ?? model.primaryModem?.id ?? "" }
     }
 
     private var lengthHint: String {
@@ -191,7 +184,7 @@ struct MessageRow: View {
                 Button(message.forwardStatus == .sent ? "Send again" : "Retry send") { model.forwardNow(message) }
             } else {
                 Button(message.forwardStatus == .sent ? "Forward again" : "Forward now") { model.forwardNow(message) }
-                    .disabled(!model.settings.telegramConfigured)
+                    .disabled(!model.settings.anyTelegramConfigured)
             }
             Divider()
             Button("Delete", role: .destructive) { model.delete(message) }

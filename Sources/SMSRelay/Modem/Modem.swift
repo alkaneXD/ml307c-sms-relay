@@ -168,5 +168,25 @@ final class Modem: Identifiable {
         return "IMEI …" + id.suffix(6)
     }
 
+    /// Last four digits of the SIM (MSISDN, else ICCID) for settings tabs.
+    var simTag: String {
+        if let n = sim.number {
+            let d = n.filter(\.isNumber)
+            if d.count >= 4 { return "…" + d.suffix(4) }
+        }
+        if let iccid = sim.iccid, iccid.count >= 4 { return "…" + iccid.suffix(4) }
+        return "…" + id.suffix(4)
+    }
+
+    /// Button label in Settings: "Air780 …8586" / "ML307 …1557".
+    var settingsChipTitle: String {
+        let model = (info.model ?? "").replacingOccurrences(of: "\"", with: "").uppercased()
+        let kind: String
+        if model.contains("780") { kind = "Air780" }
+        else if model.contains("307") { kind = "ML307" }
+        else { kind = "Modem" }
+        return "\(kind) \(simTag)"
+    }
+
     var portShortName: String { port.replacingOccurrences(of: "/dev/cu.", with: "") }
 }

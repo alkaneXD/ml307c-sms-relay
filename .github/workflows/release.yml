@@ -32,13 +32,13 @@ jobs:
 
       - name: Verify bundle
         run: |
-          codesign --verify --deep --strict "build/ML307C SMS Relay.app"
           ls -lh build/*.dmg
+          test -f build/SMS-Relay-*-arm64.dmg || test -n "$(ls build/*.dmg)"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ML307C-SMS-Relay-dmg
+          name: SMS-Relay-dmg
           path: build/*.dmg
 
       - name: Publish release

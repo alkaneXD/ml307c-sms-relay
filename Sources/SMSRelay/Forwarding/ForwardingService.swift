@@ -44,8 +44,6 @@ final class ForwardingService {
     private var pausedUntil: Date?
 
     private func processDue() async {
-        let settings = model.settings
-        guard settings.forwardingEnabled, settings.telegramConfigured else { return }
         if let until = pausedUntil {
             guard Date() >= until else { return }
             pausedUntil = nil
@@ -58,20 +56,20 @@ final class ForwardingService {
         }
         guard !due.isEmpty else { return }
 
-        let client = TelegramClient(token: settings.telegramBotToken)
-
         for msg in due {
-            // Annotate with the operator of the SIM that received the message, when we know it.
-            let operatorName = model.modem(routeKey: msg.simNumber ?? "").flatMap { PLMN.name(for: $0.operatorCode) }
-            let html = TelegramClient.format(message: msg, includeSIMNumber: settings.includeSIMNumber, operatorName: operatorName)
+            guard let modem = model.modem(routeKey: msg.simNumber ?? "") else { continue }
+            let ms = model.settings(for: modem)
+            guard ms.forwardingEnabled, ms.telegramConfigured else { continue }
+            let operatorName = PLMN.name(for: modem.operatorCode)
+            let html = TelegramClient.format(message: msg, includeSIMNumber: ms.includeSIMNumber, operatorName: operatorName)
+            let client = TelegramClient(token: ms.telegramBotToken)
             do {
-                let ids = try await client.sendMessage(chatID: settings.telegramChatID, html: html)
+                let ids = try await client.sendMessage(chatID: ms.telegramChatID, html: html)
                 try model.store.markForwarded(id: msg.id)
-                try? model.store.recordTelegramRefs(ids, chatID: settings.telegramChatID, messageID: msg.id)
+                try? model.store.recordTelegramRefs(ids, chatID: ms.telegramChatID, messageID: msg.id)
                 model.telegramStatus = nil
-                model.log("forwarded #\(msg.id) from \(msg.sender)")
+                model.log("forwarded #\(msg.id) from \(msg.sender) via \(modem.label)")
             } catch TelegramError.rateLimited(let retryAfter) {
-                // Telegram told us exactly how long to wait: pause the whole queue, don't count an attempt.
                 let until = Date().addingTimeInterval(TimeInterval(retryAfter) + 1)
                 pausedUntil = until
                 try? model.store.defer_(id: msg.id, until: until)
@@ -87,11 +85,10 @@ final class ForwardingService {
                                                 nextAttempt: gaveUp ? nil : Date().addingTimeInterval(delay), gaveUp: gaveUp)
                 model.telegramStatus = "Forwarding error: \(error.localizedDescription)"
                 model.log("forward #\(msg.id) failed (attempt \(attempts)\(gaveUp ? ", giving up" : "")): \(error.localizedDescription)")
-                if permanent { break }  // no point hammering the API with a bad token/chat
-                if case .transport? = error as? TelegramError { break }  // offline: wait for the next cycle
+                if permanent { break }
+                if case .transport? = error as? TelegramError { break }
             }
-            // Stay under Telegram's per-chat limits (1/s private, 20/min groups).
-            try? await Task.sleep(for: TelegramClient.pacingInterval(forChat: settings.telegramChatID))
+            try? await Task.sleep(for: TelegramClient.pacingInterval(forChat: ms.telegramChatID))
         }
         model.refreshPage()
     }

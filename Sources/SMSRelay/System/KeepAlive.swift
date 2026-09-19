@@ -101,15 +101,25 @@ enum KeepAlive {
     /// 0.1/0.2 registered the agent under the old name pointing at the old bundle. Replace it
     /// with one for this app so supervision continues after the rename. Returns true if migrated.
     static func migrateLegacyAgent() -> Bool {
+        var migrated = false
         let oldLabel = AppInfo.Legacy.launchAgentLabel
         let oldPlist = agentsDir.appendingPathComponent("\(oldLabel).plist")
-        guard FileManager.default.fileExists(atPath: oldPlist.path) else { return false }
-        _ = launchctl(["bootout", "\(domain)/\(oldLabel)"])
-        try? FileManager.default.removeItem(at: oldPlist)
-        if isAvailable, !isEnabled {
+        if FileManager.default.fileExists(atPath: oldPlist.path) {
+            _ = launchctl(["bootout", "\(domain)/\(oldLabel)"])
+            try? FileManager.default.removeItem(at: oldPlist)
+            migrated = true
+        }
+        if let data = try? Data(contentsOf: plistURL),
+           let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+           let args = plist["ProgramArguments"] as? [String],
+           let path = args.first,
+           path.contains(AppInfo.Legacy.previousAppBundleName) {
+            migrated = true
+        }
+        if migrated, isAvailable {
             try? enable()
         }
-        return true
+        return migrated
     }
 
     /// Only one instance may own the modem. The launchd-managed copy always wins so that

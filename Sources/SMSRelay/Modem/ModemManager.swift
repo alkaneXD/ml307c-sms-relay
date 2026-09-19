@@ -1,7 +1,7 @@
 import Foundation
 import SMSRelayCore
 
-/// Discovers ML307 modems on the USB bus and runs one `ModemService` per physical unit.
+/// Discovers ML307 / Air780 USB modems and runs one `ModemService` per physical unit.
 ///
 /// A single ML307C exposes several serial ports; two identical modems expose several each and
 /// may even share the same fake USB serial. To attach reliably we probe each unclaimed port,
@@ -42,6 +42,7 @@ final class ModemManager {
 
     func kickOutgoing() { for svc in services.values { svc.kickOutgoing() } }
     func applyNetworkLED() { for svc in services.values { svc.applyNetworkLED() } }
+    func applyNetworkLED(id: String) { services[id]?.applyNetworkLED() }
 
     // MARK: - Scan loop
 
@@ -53,9 +54,7 @@ final class ModemManager {
     }
 
     private func scanOnce() async {
-        let override = app.settings.portPath.trimmingCharacters(in: .whitespaces)
-        var ports = SerialPort.candidatePaths()
-        if !override.isEmpty { ports = ports.filter { $0 == override } }
+        let ports = SerialPort.candidatePaths()
         let present = Set(ports)
 
         // Forget cache for ports that are gone.
@@ -70,11 +69,18 @@ final class ModemManager {
             app.log("modem …\(imei.suffix(6)) removed (unplugged)")
         }
 
-        // Probe unclaimed, not-yet-cached ports.
+        // Probe unclaimed, not-yet-cached ports in parallel (one dongle = 3 ports).
         let claimed = Set(services.values.map(\.port))
-        for port in ports where !claimed.contains(port) && probeCache[port] == nil {
-            // A busy/cold/silent port is transient; only cache a conclusive probe.
-            if let result = await probe(port) { probeCache[port] = result }
+        let toProbe = ports.filter { !claimed.contains($0) && probeCache[$0] == nil }
+        if !toProbe.isEmpty {
+            await withTaskGroup(of: (String, Probe?).self) { group in
+                for port in toProbe {
+                    group.addTask { await (port, self.probe(port)) }
+                }
+                for await (port, result) in group {
+                    if let result { probeCache[port] = result }
+                }
+            }
         }
 
         // Group discovered modem ports by IMEI; start a service for any new modem.
@@ -95,7 +101,7 @@ final class ModemManager {
         }
     }
 
-    /// Opens a port briefly to learn whether it's an ML307 and, if so, its IMEI.
+    /// Opens a port briefly to learn whether it's an ML307/Air780 and, if so, its IMEI.
     private func probe(_ port: String) async -> Probe? {
         let overridden = !app.settings.portPath.trimmingCharacters(in: .whitespaces).isEmpty
         let name = URL(fileURLWithPath: port).lastPathComponent
@@ -114,14 +120,16 @@ final class ModemManager {
                 guard ok.isOK else {
                     await ch.close()
                     Self.probeLog(name, ok.final)
-                    return nil
+                    return .notModem
                 }
                 _ = try? await ch.send("ATE0", timeout: .seconds(1))
                 let info = try? await ch.send("ATI", timeout: .seconds(2))
-                let isML307 = info?.informationText.uppercased().contains("ML307") == true
-                guard isML307 || overridden else {
+                let cgmm = try? await ch.send("AT+CGMM", timeout: .seconds(2))
+                let blob = ((info?.informationText ?? "") + " " + (cgmm?.informationText ?? "")).uppercased()
+                let isSupported = blob.contains("ML307") || blob.contains("AIR780")
+                guard isSupported || overridden else {
                     await ch.close()
-                    Self.probeLog(name, "not an ML307")
+                    Self.probeLog(name, "not an ML307/Air780")
                     return .notModem
                 }
                 let imei = (try? await ch.send("AT+CGSN", timeout: .seconds(2)))?.informationText
@@ -131,7 +139,7 @@ final class ModemManager {
                     Self.probeLog(name, "empty IMEI")
                     return nil
                 }
-                Self.probeLog(name, "ML307 …\(imei.suffix(6))")
+                Self.probeLog(name, "modem …\(imei.suffix(6))")
                 return .modem(imei: imei)
             } catch {
                 await ch.close()
@@ -158,12 +166,12 @@ final class ModemManager {
             await svc.resetUSBDevice(reason: reason)
         } else {
             // No specific modem — re-enumerate every ML307 on the bus.
-            do {
-                let n = try await Task.detached { try USBReset.reenumerate(vendorID: Self.usbVendorID) }.value
-                app.log("USB re-enumerated \(n) device(s) — \(reason)")
-            } catch {
-                app.log("USB reset failed: \(error.localizedDescription)")
-            }
+            let n = await Task.detached {
+                let a = (try? USBReset.reenumerate(vendorID: Self.usbVendorID)) ?? 0
+                let b = (try? USBReset.reenumerate(vendorID: 0x19D1)) ?? 0
+                return a + b
+            }.value
+            app.log("USB re-enumerated \(n) device(s) — \(reason)")
         }
     }
 

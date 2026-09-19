@@ -40,7 +40,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if ProcessInfo.processInfo.environment["SMSRELAY_DEBUG_WINDOW"] == "1",
            let content = Self.debugWindowContent {
             let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 420, height: 580),
+                contentRect: NSRect(x: 0, y: 0, width: 460, height: 580),
                 styleMask: [.titled, .closable],
                 backing: .buffered, defer: false
             )

@@ -65,6 +65,10 @@ final class ModemService {
 
     var port: String { modem.port }
 
+    private func log(_ text: String) {
+        app.log(text, modemID: modem.id)
+    }
+
     init(app: AppModel, modem: Modem) {
         self.app = app
         self.modem = modem
@@ -96,12 +100,12 @@ final class ModemService {
             let ok = try await Task.detached { try USBReset.reenumerateDevice(forCalloutPath: path) }.value
             if ok {
                 modem.usbResets += 1
-                app.log("USB re-enumerated modem …\(modem.id.suffix(6)) — \(reason)")
+                log("USB re-enumerated modem …\(modem.id.suffix(6)) — \(reason)")
             } else {
-                app.log("USB reset: could not locate device for \(modem.portShortName)")
+                log("USB reset: could not locate device for \(modem.portShortName)")
             }
         } catch {
-            app.log("USB reset failed: \(error.localizedDescription)")
+            log("USB reset failed: \(error.localizedDescription)")
         }
     }
 
@@ -127,7 +131,7 @@ final class ModemService {
                 try await configure(ch)
                 setConnection(.connected(port: modem.port, since: Date()))
                 modem.lastError = nil
-                app.log("modem …\(modem.id.suffix(6)) connected on \(modem.portShortName)")
+                log("modem …\(modem.id.suffix(6)) connected on \(modem.portShortName)")
                 if downAlertSent {
                     let mins = disconnectedSince.map { Int(Date().timeIntervalSince($0) / 60) } ?? 0
                     app.alerter?.send(.modemUp, modem, "✅ Modem is back after \(mins) min.", force: true)
@@ -146,12 +150,12 @@ final class ModemService {
                     group.cancelAll()
                 }
             } catch ModemError.identityChanged {
-                app.log("port \(modem.portShortName) now reports a different modem — releasing")
+                log("port \(modem.portShortName) now reports a different modem — releasing")
                 await ch.close()
                 break
             } catch {
                 modem.lastError = error.localizedDescription
-                app.log("modem …\(modem.id.suffix(6)) connection lost: \(error.localizedDescription)")
+                log("modem …\(modem.id.suffix(6)) connection lost: \(error.localizedDescription)")
             }
 
             await ch.close()
@@ -188,7 +192,7 @@ final class ModemService {
             ch = try ATChannel(path: modem.port)
         } catch SerialError.open(_, let errno_) where errno_ == EBUSY && busyRounds < 5 {
             busyRounds += 1
-            app.log("\(modem.portShortName) is busy — waiting (\(busyRounds)/5)")
+            log("\(modem.portShortName) is busy — waiting (\(busyRounds)/5)")
             return nil
         } catch {
             return nil
@@ -243,7 +247,7 @@ final class ModemService {
 
         if elapsed >= attachTimeout, lastAttachRequest.map({ Date().timeIntervalSince($0) >= attachCooldown }) ?? true {
             lastAttachRequest = Date()
-            app.log("modem …\(modem.id.suffix(6)) not registered for \(Int(elapsed))s — requesting attach (AT+CGATT=1)")
+            log("modem …\(modem.id.suffix(6)) not registered for \(Int(elapsed))s — requesting attach (AT+CGATT=1)")
             _ = try? await ch.send("AT+CGATT=1", timeout: .seconds(30))
             return
         }
@@ -254,7 +258,7 @@ final class ModemService {
         }
         if let last = lastRadioKick, Date().timeIntervalSince(last) < radioKickCooldown { return }
         lastRadioKick = Date()
-        app.log("modem …\(modem.id.suffix(6)) no registration for \(Int(elapsed))s — toggling radio")
+        log("modem …\(modem.id.suffix(6)) no registration for \(Int(elapsed))s — toggling radio")
         _ = try? await ch.send("AT+CFUN=4", timeout: .seconds(15))
         try? await Task.sleep(for: .seconds(3))
         _ = try? await ch.send("AT+CFUN=1", timeout: .seconds(15))
@@ -269,7 +273,7 @@ final class ModemService {
         silentPortsSince = since
         guard Date().timeIntervalSince(since) >= zombieTimeout else { return }
         if let last = lastUSBReset, Date().timeIntervalSince(last) < usbResetCooldown { return }
-        app.log("modem …\(modem.id.suffix(6)) port present but silent for \(Int(Date().timeIntervalSince(since)))s — resetting USB")
+        log("modem …\(modem.id.suffix(6)) port present but silent for \(Int(Date().timeIntervalSince(since)))s — resetting USB")
         await resetUSBDevice(reason: "modem unresponsive")
     }
 
@@ -280,16 +284,20 @@ final class ModemService {
         try await ch.sendOK("AT+CMEE=2")
 
         if let cfun = try? await ch.send("AT+CFUN?"), cfun.value(for: "+CFUN:") != "1" {
-            app.log("modem …\(modem.id.suffix(6)) radio was off — turning on")
+            log("modem …\(modem.id.suffix(6)) radio was off — turning on")
             _ = try? await ch.send("AT+CFUN=1", timeout: .seconds(15))
         }
 
         let pin = try await ch.send("AT+CPIN?")
         modem.sim.status = pin.value(for: "+CPIN:") ?? (pin.isOK ? "Unknown" : pin.final)
 
-        modem.info.model = (try? await ch.send("AT+CGMM"))?.informationText
-        modem.info.firmware = (try? await ch.send("AT+CGMR"))?.informationText
+        let ati = try? await ch.send("ATI")
+        modem.info.model = atIdentity(try? await ch.send("AT+CGMM"), prefixes: ["+CGMM:", "+GMM:"])
+            ?? atiField(ati, name: "Model")
+        modem.info.firmware = atIdentity(try? await ch.send("AT+CGMR"), prefixes: ["+CGMR:", "+GMR:"])
+            ?? atiField(ati, name: "Revision")
         modem.info.imei = modem.id
+        if app.settingsModemID == modem.id { app.refreshPage() }
 
         if modem.sim.isReady {
             let previousIMSI = modem.sim.imsi
@@ -299,7 +307,17 @@ final class ModemService {
             var iccid = (try? await ch.send("AT+MCCID"))?.value(for: "+MCCID:").map {
                 $0.trimmingCharacters(in: .whitespacesAndNewlines)
             }
-            let number = (try? await ch.send("AT+CNUM"))?.value(for: "+CNUM:")
+            if iccid?.isEmpty ?? true {
+                iccid = (try? await ch.send("AT+CCID"))?.informationText
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            if iccid?.isEmpty ?? true, let iccidResp = try? await ch.send("AT+ICCID") {
+                let tagged = iccidResp.value(for: "+ICCID:")?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let raw = iccidResp.informationText.trimmingCharacters(in: .whitespacesAndNewlines)
+                iccid = (tagged?.isEmpty == false ? tagged : nil) ?? (raw.isEmpty ? nil : raw)
+            }
+            var number = (try? await ch.send("AT+CNUM"))?.value(for: "+CNUM:")
                 .flatMap(ATParsers.cnum)
             let smsc = (try? await ch.send("AT+CSCA?"))?.value(for: "+CSCA:")
                 .map { ATParsers.fields($0).first ?? $0 }
@@ -308,7 +326,7 @@ final class ModemService {
                 (previousICCID != nil && iccid != nil && previousICCID != iccid)
                 || (previousIMSI != nil && imsi?.isEmpty == false && previousIMSI != imsi)
             if identityChanged {
-                app.log("modem …\(modem.id.suffix(6)) SIM identity changed; clearing old SMS route")
+                log("modem …\(modem.id.suffix(6)) SIM identity changed; clearing old SMS route")
             } else {
                 // If one immutable SIM identifier still matches, retain the other through a
                 // transient query failure so canonical ICCID/IMSI routes remain aliases.
@@ -319,15 +337,31 @@ final class ModemService {
                     imsi = previousIMSI
                 }
             }
-            // Never retain a phone number across reconnect without re-reading it: after a SIM
-            // swap, an unavailable CNUM must not route old-SIM replies through the new SIM.
+            if let iccid, !iccid.isEmpty {
+                if let number, !number.isEmpty {
+                    if app.settings.msisdnByICCID[iccid] != number {
+                        var s = app.settings
+                        s.msisdnByICCID[iccid] = number
+                        app.settings = s
+                    }
+                } else if let cached = app.settings.msisdnByICCID[iccid], !cached.isEmpty {
+                    number = cached
+                    log("modem …\(modem.id.suffix(6)) MSISDN not in CNUM; using last value for this ICCID")
+                } else if !identityChanged, let existing = modem.sim.number, !existing.isEmpty {
+                    number = existing
+                    var s = app.settings
+                    s.msisdnByICCID[iccid] = existing
+                    app.settings = s
+                }
+            }
+            // Number is ICCID-keyed. A SIM swap (new ICCID) must not keep the previous MSISDN.
             modem.sim.imsi = imsi?.isEmpty == false ? imsi : nil
             modem.sim.iccid = iccid?.isEmpty == false ? iccid : nil
             modem.sim.number = number
             modem.sim.smsc = smsc
             if modem.sim.iccid == nil, modem.sim.imsi == nil {
                 modem.beginUnverifiedSIMSession()
-                app.log("modem …\(modem.id.suffix(6)) SIM identity unavailable; retries are limited to this connection")
+                log("modem …\(modem.id.suffix(6)) SIM identity unavailable; retries are limited to this connection")
             }
         }
 
@@ -344,7 +378,7 @@ final class ModemService {
         } else {
             statusReportsEnabled = false
             try await ch.sendOK("AT+CNMI=2,1,0,0,0")
-            app.log("modem …\(modem.id.suffix(6)) does not support direct SMS status reports")
+            log("modem …\(modem.id.suffix(6)) does not support direct SMS status reports")
         }
         _ = try? await ch.send("AT+CREG=2")
         _ = try? await ch.send("AT+CEREG=2")
@@ -372,7 +406,7 @@ final class ModemService {
             supportsCASIMS = true
             modem.imsSMSConfigured = configured == 1
         }
-        app.log("modem …\(modem.id.suffix(6)) SMS status: CIREG \(supportsCIREG ? "supported" : "unavailable"), CASIMS \(supportsCASIMS ? "supported" : "unavailable")")
+        log("modem …\(modem.id.suffix(6)) SMS status: CIREG \(supportsCIREG ? "supported" : "unavailable"), CASIMS \(supportsCASIMS ? "supported" : "unavailable")")
     }
 
     private func applyIMSRegistration(_ value: String, isURC: Bool) {
@@ -390,10 +424,10 @@ final class ModemService {
     }
 
     private func applyNetworkLED(_ ch: ATChannel) async {
-        let on = app.settings.networkLED
-        if let r = try? await ch.send("AT+MLED=0,\(on ? 1 : 0)"), !r.isOK {
-            app.log("network LED not controllable: \(r.final)")
-        }
+        let on = app.settings(for: modem).networkLED ? 1 : 0
+        if let r = try? await ch.send("AT+MLED=0,\(on)"), r.isOK { return }
+        if let r = try? await ch.send("AT+CNETLIGHT=\(on)"), r.isOK { return }
+        log("network LED not controllable")
     }
 
     func applyNetworkLED() {
@@ -410,11 +444,13 @@ final class ModemService {
               Date().timeIntervalSince(since) >= noSignalBlinkGrace else { return }
         if let last = lastNoSignalBlink, Date().timeIntervalSince(last) < noSignalBlinkCooldown { return }
         lastNoSignalBlink = Date()
-        app.log("modem …\(modem.id.suffix(6)) no signal — blinking NET LED 5×")
+        log("modem …\(modem.id.suffix(6)) no signal — blinking NET LED 5×")
         for _ in 0..<5 {
             _ = try? await ch.send("AT+MLED=0,1", timeout: .seconds(1))
+            _ = try? await ch.send("AT+CNETLIGHT=1", timeout: .seconds(1))
             try? await Task.sleep(for: noSignalBlinkOn)
             _ = try? await ch.send("AT+MLED=0,0", timeout: .seconds(1))
+            _ = try? await ch.send("AT+CNETLIGHT=0", timeout: .seconds(1))
             try? await Task.sleep(for: noSignalBlinkOff)
         }
         await applyNetworkLED(ch)
@@ -435,19 +471,19 @@ final class ModemService {
 
         if let dial = try? await ch.send("AT+MDIALUP?"), dial.values(for: "+MDIALUP:").contains(where: { ATParsers.fields($0).count > 2 }) {
             _ = try? await ch.send("AT+MDIALUP=1,0", timeout: .seconds(10))
-            app.log("modem …\(modem.id.suffix(6)) data session was active — disconnected")
+            log("modem …\(modem.id.suffix(6)) data session was active — disconnected")
         }
 
         if auto == true {
             let r = try? await ch.send("AT+MDIALUPCFG=\"auto\",0")
             if r?.isOK == true {
                 modem.modemAutoDial = false
-                app.log("modem …\(modem.id.suffix(6)) disabled host auto-dialup (persistent)")
+                log("modem …\(modem.id.suffix(6)) disabled host auto-dialup (persistent)")
             }
         }
         if autoconn == false {
             _ = try? await ch.send("AT+MUECONFIG=\"autoconn\",1")
-            app.log("modem …\(modem.id.suffix(6)) re-enabled auto-attach (autoconn=1)")
+            log("modem …\(modem.id.suffix(6)) re-enabled auto-attach (autoconn=1)")
         }
     }
 
@@ -497,7 +533,16 @@ final class ModemService {
             modem.accessTechnology = cops.accessTechnology
         }
         if modem.sim.number == nil, modem.sim.isReady {
-            modem.sim.number = (try? await ch.send("AT+CNUM"))?.value(for: "+CNUM:").flatMap(ATParsers.cnum)
+            if let n = (try? await ch.send("AT+CNUM"))?.value(for: "+CNUM:").flatMap(ATParsers.cnum) {
+                modem.sim.number = n
+                if let iccid = modem.sim.iccid, !iccid.isEmpty {
+                    var s = app.settings
+                    s.msisdnByICCID[iccid] = n
+                    app.settings = s
+                }
+            } else if let iccid = modem.sim.iccid, let cached = app.settings.msisdnByICCID[iccid], !cached.isEmpty {
+                modem.sim.number = cached
+            }
         }
     }
 
@@ -513,7 +558,7 @@ final class ModemService {
                 throw ModemError.disconnected
             } catch {
                 modem.consecutiveHeartbeatMisses += 1
-                app.log("modem …\(modem.id.suffix(6)) heartbeat miss #\(modem.consecutiveHeartbeatMisses): \(error.localizedDescription)")
+                log("modem …\(modem.id.suffix(6)) heartbeat miss #\(modem.consecutiveHeartbeatMisses): \(error.localizedDescription)")
                 if modem.consecutiveHeartbeatMisses >= 3 { throw ModemError.disconnected }
             }
         }
@@ -546,7 +591,7 @@ final class ModemService {
                     modem.registrationUpdatedAt = Date()
                     updateSMSReadySince(wasReady: wasSMSReady)
                     let domain = line.hasPrefix("+CEREG:") ? "EPS" : "CS"
-                    app.log("modem …\(modem.id.suffix(6)) \(domain) registration → \(reg.statusText) \(ATParsers.accessTechnologyName(reg.accessTechnology))")
+                    log("modem …\(modem.id.suffix(6)) \(domain) registration → \(reg.statusText) \(ATParsers.accessTechnologyName(reg.accessTechnology))")
                 }
             } else if line.hasPrefix("+CIREGU:") || line.hasPrefix("+CIREG:") {
                 let body = line.split(separator: ":", maxSplits: 1).last.map(String.init) ?? ""
@@ -565,7 +610,7 @@ final class ModemService {
                     throw ModemError.disconnected
                 }
             } else {
-                app.log("URC [\(modem.label)] \(line)")
+                log("URC [\(modem.label)] \(line)")
             }
         }
         throw ModemError.disconnected
@@ -594,14 +639,14 @@ final class ModemService {
                 )
             }
             guard let match = matched else {
-                app.log("unmatched SMS status report MR \(report.messageReference) to \(report.recipient)")
+                log("unmatched SMS status report MR \(report.messageReference) to \(report.recipient)")
                 return
             }
 
             let outcome = report.isDelivered
                 ? "delivered"
                 : report.isComplete ? "complete, status \(report.status)" : "pending, status \(report.status)"
-            app.log("SMS status #\(match.messageID) part \(match.sequence) MR \(report.messageReference): \(outcome)")
+            log("SMS status #\(match.messageID) part \(match.sequence) MR \(report.messageReference): \(outcome)")
 
             // A report can be the only positive evidence after CMGS timed out. Finalize a
             // fully-reported message even if its queue row had already reached gave_up.
@@ -619,11 +664,11 @@ final class ModemService {
                     }
                 }
             } else if try app.store.reviveOutgoingAfterStatusReport(messageID: match.messageID) {
-                app.log("SMS status #\(match.messageID) resolved a timed-out part; resuming remaining parts")
+                log("SMS status #\(match.messageID) resolved a timed-out part; resuming remaining parts")
             }
             kickOutgoing()
         } catch {
-            app.log("invalid SMS status report: \(error.localizedDescription)")
+            log("invalid SMS status report: \(error.localizedDescription)")
         }
     }
 
@@ -652,19 +697,19 @@ final class ModemService {
             if memory != currentMemory { try await selectMemory(ch, memory) }
             let r = try await ch.send("AT+CMGR=\(index)", timeout: .seconds(8))
             guard r.isOK else {
-                app.log("CMGR \(index) failed: \(r.final)")
+                log("CMGR \(index) failed: \(r.final)")
                 return
             }
             let entries = ATParsers.pduEntries(from: r, listing: false)
             for entry in entries {
                 app.ingest(pdu: entry.pdu, status: entry.status, from: modem)
             }
-            if app.settings.deleteFromSIM, !entries.isEmpty {
+            if app.settings(for: modem).deleteFromSIM, !entries.isEmpty {
                 _ = try? await ch.send("AT+CMGD=\(index)")
             }
             if memory != "SM" { try await selectMemory(ch, "SM") } else { await updateStorage(ch) }
         } catch {
-            app.log("read \(memory)/\(index) failed: \(error.localizedDescription)")
+            log("read \(memory)/\(index) failed: \(error.localizedDescription)")
         }
     }
 
@@ -675,13 +720,13 @@ final class ModemService {
             do { try await selectMemory(ch, mem) } catch { continue }
             let r = try await ch.send("AT+CMGL=4", timeout: .seconds(20))
             guard r.isOK else {
-                app.log("CMGL on \(mem) failed: \(r.final)")
+                log("CMGL on \(mem) failed: \(r.final)")
                 continue
             }
             for entry in ATParsers.pduEntries(from: r, listing: true) {
                 guard entry.status == 0 || entry.status == 1 else { continue }
                 app.ingest(pdu: entry.pdu, status: entry.status, from: modem)
-                if app.settings.deleteFromSIM, let idx = entry.index {
+                if app.settings(for: modem).deleteFromSIM, let idx = entry.index {
                     _ = try? await ch.send("AT+CMGD=\(idx)")
                 }
             }
@@ -691,12 +736,12 @@ final class ModemService {
 
     private func sweepLoop(_ ch: ATChannel) async throws {
         while !Task.isCancelled {
-            let interval = max(5, app.settings.pollIntervalSeconds)
+            let interval = max(5, app.settings(for: modem).pollIntervalSeconds)
             try await Task.sleep(for: .seconds(interval))
             try await sweepStoredMessages(ch)
-            let flushed = try app.store.flushStaleParts(olderThan: stalePartAge, forwardingEnabled: app.settings.forwardingEnabled)
+            let flushed = try app.store.flushStaleParts(olderThan: stalePartAge, forwardingEnabled: app.settings(for: modem).forwardingEnabled)
             if !flushed.isEmpty {
-                app.log("flushed \(flushed.count) incomplete multipart message(s)")
+                log("flushed \(flushed.count) incomplete multipart message(s)")
                 app.refreshPage()
                 app.forwardingService?.kick()
             }
@@ -743,7 +788,7 @@ final class ModemService {
             do {
                 let parts = try await sendSMS(ch, message: msg)
                 if try app.store.markOutgoingSent(id: msg.id, parts: parts) {
-                    app.log("modem …\(modem.id.suffix(6)) sent SMS to \(msg.sender) (\(parts) part\(parts == 1 ? "" : "s"))")
+                    log("modem …\(modem.id.suffix(6)) sent SMS to \(msg.sender) (\(parts) part\(parts == 1 ? "" : "s"))")
                     await app.notifyOutgoing(msg, result: .success(parts))
                 }
             } catch is CancellationError {
@@ -758,7 +803,7 @@ final class ModemService {
                     nextAttempt: gaveUp ? nil : Date().addingTimeInterval(delay), gaveUp: gaveUp
                 )) ?? false
                 guard recorded else { continue } // a concurrent +CDS already finalized it
-                app.log("send to \(msg.sender) failed (attempt \(attempts)\(gaveUp ? ", giving up" : "")): \(error.localizedDescription)")
+                log("send to \(msg.sender) failed (attempt \(attempts)\(gaveUp ? ", giving up" : "")): \(error.localizedDescription)")
                 if gaveUp {
                     await app.notifyOutgoing(msg, result: .failure(error))
                 } else if attempts == 1 {
@@ -828,12 +873,12 @@ final class ModemService {
                 )
                 if let modemReference, modemReference != Int(part.messageReference), !loggedTPMRRewrite {
                     loggedTPMRRewrite = true
-                    app.log(
+                    log(
                         "warning: modem rewrote SMS TP-MR \(part.messageReference) as \(modemReference); "
                         + "network-level duplicate suppression may be weaker"
                     )
                 }
-                app.log(
+                log(
                     "SMS submit #\(message.id) part \(part.sequence)/\(part.total) MR \(part.messageReference) "
                     + "attempt \(part.attempts) accepted · prompt \(Self.ms(exchange.promptLatency)) ms, "
                     + "network \(Self.ms(exchange.finalLatency)) ms · \(smsNetworkSnapshot)"
@@ -854,7 +899,7 @@ final class ModemService {
                     try app.store.markOutgoingPartSubmitted(
                         messageID: message.id, sequence: part.sequence, modemReference: nil
                     )
-                    app.log(
+                    log(
                         "SMS submit #\(message.id) part \(part.sequence)/\(part.total) MR \(part.messageReference) "
                         + "already accepted; SMSC suppressed duplicate · \(smsNetworkSnapshot)"
                     )
@@ -865,7 +910,7 @@ final class ModemService {
                     try? app.store.markOutgoingPartAmbiguous(
                         messageID: message.id, sequence: part.sequence, error: error.localizedDescription
                     )
-                    app.log(
+                    log(
                         "SMS submit #\(message.id) part \(part.sequence)/\(part.total) MR \(part.messageReference) "
                         + "attempt \(part.attempts) ambiguous (+CMS \(code ?? -1)) · \(smsNetworkSnapshot)"
                     )
@@ -921,6 +966,36 @@ final class ModemService {
         default:
             return false
         }
+    }
+
+    /// CGMM/CGMR may be a bare line (ML307, our Air780 shim) or `+CGMR: "…"`.
+    private func atIdentity(_ r: ATResponse?, prefixes: [String]) -> String? {
+        guard let r else { return nil }
+        for p in prefixes {
+            if let v = r.value(for: p) {
+                let s = Self.stripIdent(v)
+                if !s.isEmpty { return s }
+            }
+        }
+        let s = Self.stripIdent(r.informationText)
+        return s.isEmpty ? nil : s
+    }
+
+    private func atiField(_ r: ATResponse?, name: String) -> String? {
+        guard let r else { return nil }
+        let prefix = name.lowercased() + ":"
+        for line in r.lines {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            guard t.lowercased().hasPrefix(prefix) else { continue }
+            let s = Self.stripIdent(String(t.dropFirst(prefix.count)))
+            if !s.isEmpty { return s }
+        }
+        return nil
+    }
+
+    private static func stripIdent(_ s: String) -> String {
+        s.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "\"", with: "")
     }
 }
 

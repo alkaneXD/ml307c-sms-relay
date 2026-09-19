@@ -16,17 +16,17 @@ final class HealthAlerter {
     }
 
     func send(_ topic: Topic, _ modem: Modem, _ text: String, force: Bool = false) {
-        let settings = model.settings
-        guard settings.healthAlerts, settings.telegramConfigured else { return }
+        let ms = model.settings(for: modem)
+        guard ms.healthAlerts, ms.telegramConfigured else { return }
         let key = "\(topic.rawValue)|\(modem.id)"
         if !force, let last = lastSent[key], Date().timeIntervalSince(last) < minInterval { return }
         lastSent[key] = Date()
-        let client = TelegramClient(token: settings.telegramBotToken)
+        let client = TelegramClient(token: ms.telegramBotToken)
         let host = Host.current().localizedName ?? "Mac"
         let html = "\(text)\n<i>\(AppInfo.shortName) · \(TelegramClient.escapeHTML(modem.label)) · \(host)</i>"
         Task {
             do {
-                try await client.sendMessage(chatID: settings.telegramChatID, html: html)
+                try await client.sendMessage(chatID: ms.telegramChatID, html: html)
             } catch {
                 model.log("health alert failed: \(error.localizedDescription)")
             }

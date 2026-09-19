@@ -1,12 +1,12 @@
-# ML307C SMS Relay
+# SMS Relay
 
-A tiny native macOS menu-bar app that bridges an **ML307C USB LTE modem** to **Telegram**:
+A tiny native macOS menu-bar app that bridges **USB Cat.1 modems** to **Telegram**:
 incoming SMS are forwarded to a Telegram chat, and you can reply straight from Telegram to
 send an SMS back through the SIM. Built to run unattended on a 24/7 Mac (e.g. a Mac mini).
 
 - **Two-way SMS** — forward incoming SMS to Telegram; reply in Telegram to send one back.
-- **Multiple modems** — plug in any number of ML307C units; each is detected automatically and
-  tagged by its SIM. Replies go back out through the SIM that received the original message.
+- **Multiple modems** — plug in ML307C and Air780EPM sticks together; pick a SIM in the header
+  to see that stick’s inbox, settings, and log. Each modem can send to its own Telegram chat.
 - **Reliable by design** — persistent SQLite queue, automatic reconnect, heartbeat, network
   re-registration watchdog, USB re-enumeration for a wedged modem, and launchd supervision.
 - **Never uses the modem for internet** — disables the modem's USB-Ethernet interface on macOS
@@ -15,9 +15,10 @@ send an SMS back through the SIM. Built to run unattended on a 24/7 Mac (e.g. a 
 
 ## Hardware
 
-China Mobile **ML307C** (Cat.1) USB modem — the "Tiny dongle" board pictured below (LeLian).
-It has a nano-SIM slot and exposes a CDC-ACM AT interface; the app talks raw AT commands and
-PDU-mode SMS over the serial port. Any ML307C USB dongle of this type works.
+Supported USB Cat.1 sticks:
+
+- China Mobile **ML307C** (LeLian tiny dongle) — stock AT firmware.
+- Hezhou **Air780EPM** — must flash `firmware/air780epm/` (LuatOS AT-SMS bridge). Official AT firmware does not exist for EPM. The button next to USB is **BOOT** (download mode), not “root”.
 
 <p align="center">
   <img src="docs/ml307c-dongle.jpg" alt="ML307C USB dongle (Tiny dongle V1.0 / LeLian) — front and back" width="360">
@@ -26,18 +27,18 @@ PDU-mode SMS over the serial port. Any ML307C USB dongle of this type works.
 ## Requirements
 
 - macOS 14 (Sonoma) or later, Apple silicon.
-- An ML307C USB modem with an SMS-capable SIM.
+- An ML307C or Air780EPM USB modem with an SMS-capable SIM.
 - A Telegram bot token and a chat ID (see setup).
 
 ## Install
 
-1. Download the latest `ML307C-SMS-Relay-<version>-arm64.dmg` from the
+1. Download the latest `SMS-Relay-<version>-arm64.dmg` from the
    [Releases](../../releases) page.
-2. Open the DMG and drag **ML307C SMS Relay** to **Applications**.
+2. Open the DMG and drag **SMS Relay** onto **Applications**.
 3. The app is ad-hoc signed (no Apple Developer ID). On first launch Gatekeeper may block it —
    right-click the app → **Open**, or run:
    ```sh
-   xattr -dr com.apple.quarantine "/Applications/ML307C SMS Relay.app"
+   xattr -dr com.apple.quarantine "/Applications/SMS Relay.app"
    ```
 4. Launch it. A signal-bars icon appears in the menu bar. On first run from `/Applications`
    it enables "run at login & restart if it crashes" automatically.
@@ -92,7 +93,7 @@ bundle or this repository.
 ## Build from source
 
 ```sh
-make dmg      # release build + bundle + build/ML307C-SMS-Relay-<version>-arm64.dmg
+make dmg      # release build + bundle + build/SMS-Relay-<version>-arm64.dmg
 make run      # build the .app and launch it
 make debug    # run the debug binary in the foreground (AT trace on stderr)
 ```

@@ -700,11 +700,19 @@ public final class MessageStore: @unchecked Sendable {
         }
     }
 
-    public func page(index: Int, size: Int, search: String = "") throws -> MessagePage {
+    public func page(index: Int, size: Int, search: String = "", routeKeys: [String]? = nil) throws -> MessagePage {
         let q = search.trimmingCharacters(in: .whitespaces)
-        let whereClause = q.isEmpty ? "" : "WHERE sender LIKE ? OR body LIKE ?"
-        let like = "%\(q)%"
-        let params: [SQLValue] = q.isEmpty ? [] : [.text(like), .text(like)]
+        var clauses: [String] = []
+        var params: [SQLValue] = []
+        let (routeSQL, routeParams) = routePredicate(routeKeys)
+        clauses.append(routeSQL)
+        params += routeParams
+        if !q.isEmpty {
+            clauses.append("(sender LIKE ? OR body LIKE ?)")
+            let like = "%\(q)%"
+            params += [.text(like), .text(like)]
+        }
+        let whereClause = "WHERE " + clauses.joined(separator: " AND ")
 
         let total = try db.scalarInt("SELECT COUNT(*) FROM messages \(whereClause)", params)
         let pageCount = max(1, (total + size - 1) / size)
@@ -737,17 +745,28 @@ public final class MessageStore: @unchecked Sendable {
         public static let zero = Counts(total: 0, pending: 0, failed: 0, sent: 0)
     }
 
-    public func counts() throws -> Counts {
-        try db.withStatement("""
+    public func counts(routeKeys: [String]? = nil) throws -> Counts {
+        let (routeSQL, routeParams) = routePredicate(routeKeys)
+        return try db.withStatement("""
         SELECT COUNT(*),
                SUM(forward_status IN ('pending','failed')),
                SUM(forward_status = 'gave_up'),
                SUM(forward_status = 'sent')
-        FROM messages WHERE direction = 'in'
+        FROM messages WHERE direction = 'in' AND \(routeSQL)
         """) { s in
+            try s.bind(routeParams)
             _ = try s.step()
             return Counts(total: s.int(0), pending: s.int(1), failed: s.int(2), sent: s.int(3))
         }
+    }
+
+    /// `nil` = every row (tests / unscoped). Empty list = no rows. Otherwise `sim_number IN (keys)`.
+    private func routePredicate(_ keys: [String]?) -> (String, [SQLValue]) {
+        guard let keys else { return ("1=1", []) }
+        let uniq = keys.filter { !$0.isEmpty }
+        if uniq.isEmpty { return ("1=0", []) }
+        let placeholders = uniq.map { _ in "?" }.joined(separator: ",")
+        return ("sim_number IN (\(placeholders))", uniq.map { .text($0) })
     }
 
     public func delete(id: Int64) throws {

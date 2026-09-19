@@ -7,6 +7,7 @@ struct LogEntry: Identifiable, Equatable {
     let id = UUID()
     let date: Date
     let text: String
+    let modemID: String?
 }
 
 /// Single source of truth for the UI. Services mutate it on the main actor.
@@ -34,19 +35,40 @@ final class AppModel {
     var telegramListening = false
     var chatCandidates: [TelegramChatCandidate] = []
 
+    /// `"app"` or a modem IMEI. Inbox, Log, Settings, and the header all follow this selection.
+    var settingsModemID: String = "app" {
+        didSet {
+            guard oldValue != settingsModemID else { return }
+            pageIndex = 0
+            refreshPage()
+        }
+    }
+
+    var selectedModem: Modem? {
+        guard settingsModemID != "app" else { return nil }
+        return modems.first { $0.id == settingsModemID }
+    }
+
+    /// `nil` = unscoped (should not be used by the UI). Empty = no rows. Else this stick's SIM keys.
+    var inboxRouteKeys: [String] {
+        if settingsModemID == "app" { return [] }
+        if let modem = selectedModem { return modem.routeAliases }
+        return ["imei:" + settingsModemID]
+    }
+
     // Settings
     var settings: Settings {
         didSet {
             guard settings != oldValue else { return }
             do { try settingsStore.save(settings) } catch { log("settings save failed: \(error.localizedDescription)") }
             if settings.portPath != oldValue.portPath { modemManager?.rescan() }
-            if settings.networkLED != oldValue.networkLED { modemManager?.applyNetworkLED() }
             if settings.preventSystemSleep != oldValue.preventSystemSleep { updatePowerAssertion() }
             if settings.pageSize != oldValue.pageSize { refreshPage() }
-            if settings.forwardingEnabled != oldValue.forwardingEnabled
-                || settings.telegramBotToken != oldValue.telegramBotToken
-                || settings.telegramChatID != oldValue.telegramChatID {
+            if settings.modems != oldValue.modems {
                 forwardingService?.kick()
+                for (id, s) in settings.modems where s.networkLED != oldValue.modems[id]?.networkLED {
+                    modemManager?.applyNetworkLED(id: id)
+                }
             }
         }
     }
@@ -137,10 +159,18 @@ final class AppModel {
 
     func addModem(_ modem: Modem) {
         guard !modems.contains(where: { $0.id == modem.id }) else { return }
+        if settings.modems[modem.id] == nil {
+            settings.updateModem(modem.id) { _ in }
+        }
         modems.append(modem)
         modems.sort { $0.id < $1.id }
         updatePowerAssertion()
+        if settingsModemID == modem.id { refreshPage() }
     }
+
+    func settings(for modem: Modem) -> ModemSettings { settings.modem(modem.id) }
+
+    func settings(forIMEI imei: String) -> ModemSettings { settings.modem(imei) }
 
     func removeModem(id: String) {
         modems.removeAll { $0.id == id }
@@ -149,6 +179,30 @@ final class AppModel {
 
     func modem(id: String) -> Modem? { modems.first { $0.id == id } }
     func modem(routeKey: String) -> Modem? { modems.first { $0.matches(routeKey: routeKey) } }
+
+    /// Manual MSISDN when the stick cannot read EF_MSISDN (typical on Air780). Keyed by ICCID.
+    func setSIMNumber(_ raw: String, for modem: Modem) {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalized: String?
+        if trimmed.isEmpty {
+            normalized = nil
+        } else {
+            normalized = PDUEncoder.normalizeNumber(trimmed) ?? trimmed
+        }
+        modem.sim.number = normalized
+        guard let iccid = modem.sim.iccid, !iccid.isEmpty else {
+            log("modem …\(modem.id.suffix(6)) SIM number \(normalized ?? "cleared") (session only — no ICCID yet)")
+            return
+        }
+        var s = settings
+        if let normalized {
+            s.msisdnByICCID[iccid] = normalized
+        } else {
+            s.msisdnByICCID.removeValue(forKey: iccid)
+        }
+        settings = s
+        log("modem …\(modem.id.suffix(6)) SIM number \(normalized ?? "cleared") for ICCID …\(iccid.suffix(4))")
+    }
 
     /// The modem used for outgoing SMS that aren't a reply (composer, /sms) — prefer one
     /// with a fresh SMS-capable registration, then any network-registered modem.
@@ -184,9 +238,10 @@ final class AppModel {
 
     func refreshPage() {
         do {
-            page = try store.page(index: pageIndex, size: settings.pageSize, search: search)
+            page = try store.page(index: pageIndex, size: settings.pageSize, search: search,
+                                  routeKeys: inboxRouteKeys)
             pageIndex = page.pageIndex
-            counts = try store.counts()
+            counts = try store.counts(routeKeys: inboxRouteKeys)
         } catch {
             log("page load failed: \(error.localizedDescription)")
         }
@@ -220,7 +275,7 @@ final class AppModel {
             simDisplay: modem.sim.number ?? modem.label
         )
         do {
-            switch try store.ingest(incoming, forwardingEnabled: settings.forwardingEnabled) {
+            switch try store.ingest(incoming, forwardingEnabled: settings(for: modem).forwardingEnabled) {
             case .stored(let msg):
                 log("SMS to \(modem.label) from \(msg.sender): \(msg.body.prefix(60))")
                 refreshPage()
@@ -254,17 +309,17 @@ final class AppModel {
 
     /// First failure of an outgoing SMS: tell the requester it's being retried instead of going silent.
     func notifyOutgoingRetrying(_ message: StoredMessage, error: Error, in delay: TimeInterval) async {
-        guard settings.telegramConfigured, message.telegramRequestID != nil else { return }
-        let client = TelegramClient(token: settings.telegramBotToken)
+        guard message.telegramRequestID != nil, let tg = telegramTarget(for: message) else { return }
+        let client = TelegramClient(token: tg.token)
         let reason = TelegramClient.escapeHTML(error.localizedDescription.replacingOccurrences(of: "AT+CMGS → ", with: ""))
         let html = "⏳ No acknowledgement from the SMS network (\(reason)) — retrying in \(Int(delay)) s. The same stored SMS will be reused, but a carrier-side duplicate is still possible."
-        _ = try? await client.sendMessage(chatID: settings.telegramChatID, html: html, replyTo: message.telegramRequestID)
+        _ = try? await client.sendMessage(chatID: tg.chatID, html: html, replyTo: message.telegramRequestID)
     }
 
     /// Posts the outcome of an outgoing SMS back to the Telegram message that asked for it.
     func notifyOutgoing(_ message: StoredMessage, result: Result<Int, Error>) async {
-        guard settings.telegramConfigured else { return }
-        let client = TelegramClient(token: settings.telegramBotToken)
+        guard let tg = telegramTarget(for: message) else { return }
+        let client = TelegramClient(token: tg.token)
         let number = TelegramClient.escapeHTML(message.sender)
         let html: String
         switch result {
@@ -274,9 +329,20 @@ final class AppModel {
             html = "❌ Could not send to <b>\(number)</b>: \(TelegramClient.escapeHTML(error.localizedDescription))"
         }
         do {
-            try await client.sendMessage(chatID: settings.telegramChatID, html: html, replyTo: message.telegramRequestID)
+            try await client.sendMessage(chatID: tg.chatID, html: html, replyTo: message.telegramRequestID)
         } catch {
             log("telegram ack failed: \(error.localizedDescription)")
+        }
+    }
+
+    func telegramTarget(for message: StoredMessage) -> (token: String, chatID: String)? {
+        if let modem = modem(routeKey: message.simNumber ?? "") {
+            let s = settings(for: modem)
+            guard s.telegramConfigured else { return nil }
+            return (s.telegramBotToken, s.telegramChatID)
+        }
+        return settings.modems.values.first { $0.telegramConfigured }.map {
+            ($0.telegramBotToken, $0.telegramChatID)
         }
     }
 
@@ -304,28 +370,29 @@ final class AppModel {
 
     // MARK: - Telegram helpers
 
-    func testTelegram() async {
+    func testTelegram(imei: String) async {
+        let s = settings.modem(imei)
         telegramBusy = true
         defer { telegramBusy = false }
-        let client = TelegramClient(token: settings.telegramBotToken)
+        let client = TelegramClient(token: s.telegramBotToken)
         do {
             let me = try await client.getMe()
             telegramBot = me
-            let sims = modems.compactMap(\.sim.number)
-            let who = sims.isEmpty ? "the attached SIM(s)" : sims.joined(separator: ", ")
-            try await client.sendMessage(chatID: settings.telegramChatID,
+            let who = modem(id: imei)?.label ?? "this modem"
+            try await client.sendMessage(chatID: s.telegramChatID,
                                          html: "✅ \(AppInfo.displayName) connected. Forwarding SMS for <b>\(TelegramClient.escapeHTML(who))</b>.")
             telegramStatus = "Test message sent via @\(me.username)"
         } catch {
             telegramStatus = "Failed: \(error.localizedDescription)"
         }
-        log("telegram test: \(telegramStatus ?? "")")
+        log("telegram test (\(imei.suffix(4))): \(telegramStatus ?? "")")
     }
 
-    func detectChats() async {
+    func detectChats(imei: String) async {
+        let s = settings.modem(imei)
         telegramBusy = true
         defer { telegramBusy = false }
-        let client = TelegramClient(token: settings.telegramBotToken)
+        let client = TelegramClient(token: s.telegramBotToken)
         do {
             let me = try await client.getMe()
             telegramBot = me
@@ -367,8 +434,8 @@ final class AppModel {
 
     // MARK: - Log
 
-    func log(_ text: String) {
-        logEntries.append(LogEntry(date: Date(), text: text))
+    func log(_ text: String, modemID: String? = nil) {
+        logEntries.append(LogEntry(date: Date(), text: text, modemID: modemID))
         if logEntries.count > 300 { logEntries.removeFirst(logEntries.count - 300) }
         fileLog?.write(text)
         #if DEBUG
@@ -376,5 +443,24 @@ final class AppModel {
         df.dateFormat = "HH:mm:ss"
         FileHandle.standardError.write(Data("[\(df.string(from: Date()))] \(text)\n".utf8))
         #endif
+    }
+
+    var visibleLogEntries: [LogEntry] {
+        if settingsModemID == "app" {
+            return logEntries.filter { $0.modemID == nil && !Self.logTextIsModemScoped($0.text) }
+        }
+        let id = settingsModemID
+        let tag6 = "…" + id.suffix(6)
+        let tag4 = "(" + id.suffix(4) + ")"
+        return logEntries.filter { e in
+            if e.modemID == id { return true }
+            if e.text.contains(tag6) { return true }
+            if e.text.contains(tag4) { return true }
+            return false
+        }
+    }
+
+    private static func logTextIsModemScoped(_ text: String) -> Bool {
+        text.contains("modem …") || text.contains("USB re-enumerated modem")
     }
 }
