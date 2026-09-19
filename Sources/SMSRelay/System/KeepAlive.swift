@@ -71,6 +71,12 @@ enum KeepAlive {
         startSupervisedCopy()
     }
 
+    /// Drop a loaded job before bootstrap so launchd does not keep a stale ProgramArguments
+    /// (rename /Applications/ML307C SMS Relay.app → SMS Relay.app left EX_CONFIG 78).
+    private static func unloadAgent() {
+        _ = launchctl(["bootout", "\(domain)/\(label)"])
+    }
+
     /// Removes the agent so it no longer starts at login. The current session is left alone
     /// (a still-loaded job just means a crash would still be caught until logout).
     static func disable() throws {
@@ -85,6 +91,9 @@ enum KeepAlive {
     /// Ask launchd to run the supervised copy now. If the job is already loaded but idle
     /// (e.g. after an update), kickstart it. The new copy then terminates any manual copy.
     static func startSupervisedCopy() {
+        if !isLaunchdManaged {
+            unloadAgent()
+        }
         if launchctl(["bootstrap", domain, plistURL.path]) != 0 {
             _ = launchctl(["kickstart", "\(domain)/\(label)"])
         }
